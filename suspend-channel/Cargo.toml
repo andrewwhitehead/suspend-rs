@@ -1,0 +1,26 @@
+[package]
+name = "suspend-channel"
+version = "0.1.0"
+authors = ["Andrew Whitehead <cywolf@gmail.com>"]
+edition = "2018"
+description = ""
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/andrewwhitehead/suspend-rs/"
+categories = ["asynchronous", "concurrency", "data-structures"]
+keywords = ["park", "future", "stream", "thread", "waker"]
+
+[lib]
+name = "suspend_channel"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+futures-core = "0.3"
+maybe-cell = "0.1"
+
+[dev-dependencies]
+futures-lite = "1.11"
+futures-task = "0.3"
