@@ -1,10 +1,15 @@
-use std::any::Any;
 use std::collections::VecDeque;
+use std::marker::PhantomData;
+use std::mem;
 use std::panic;
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
+use std::{
+    any::Any,
+    sync::atomic::{fence, AtomicUsize, Ordering},
+};
 
 use suspend_channel::{send_once, ReceiveOnce};
 use tracing::info;
@@ -77,7 +82,8 @@ impl ThreadPool {
                     panic: None,
                     shutdown: false,
                 }),
-                cvar: Condvar::new(),
+                queue_cvar: Condvar::new(),
+                complete_cvar: Condvar::new(),
             }),
         };
         if config.min_count > 0 {
@@ -99,17 +105,22 @@ impl ThreadPool {
     // TODO: add join
     // TODO: set stack size
 
+    #[inline]
     pub fn run<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
     {
+        self.run_boxed(Box::new(f))
+    }
+
+    pub(crate) fn run_boxed(&self, f: Runnable<'static>) {
         let mut state = self.inner.state.lock().unwrap();
         if let Some(panic) = state.panic.take() {
             panic::resume_unwind(panic);
         }
-        state.queue.push_back(Box::new(f));
+        state.queue.push_back(f);
         if !self.inner.maybe_spawn(state) {
-            self.inner.cvar.notify_one();
+            self.inner.queue_cvar.notify_one();
         }
     }
 
@@ -125,13 +136,18 @@ impl ThreadPool {
         recv
     }
 
-    // pub fn scope<'pool, 's, F, T>(&'pool self, f: F) -> T
-    // where
-    //     F: FnOnce(&mut ThreadScope<'pool, 's, T>) -> T + Send + 's,
-    //     T: 'static,
-    // {
-    //     //
-    // }
+    pub fn scoped<'pool, 's, F, T>(&'pool self, f: F) -> T
+    where
+        F: FnOnce(&mut ThreadScope<'pool, 's>) -> T + Send + 's,
+        T: Send + 'static,
+    {
+        let mut scope = ThreadScope {
+            counter: AtomicUsize::new(0),
+            pool: self,
+            _marker: PhantomData,
+        };
+        f(&mut scope)
+    }
 
     // pub fn async_scope<'pool, 's, F, T>(&'pool self, f: F) -> ScopeFuture<'s, T>
     // where
@@ -166,7 +182,8 @@ impl From<ThreadPoolConfig> for ThreadPool {
 
 struct ThreadPoolInner {
     state: Mutex<ThreadPoolState>,
-    cvar: Condvar,
+    queue_cvar: Condvar,
+    complete_cvar: Condvar,
 }
 
 impl ThreadPoolInner {
@@ -185,7 +202,6 @@ impl ThreadPoolInner {
                 state.idle_count -= 1;
                 tasks += 1;
                 self.maybe_spawn(state);
-                info!("run task");
                 let panic_result = panic::catch_unwind(panic::AssertUnwindSafe(task));
                 state = self.state.lock().unwrap();
                 state.idle_count += 1;
@@ -199,24 +215,28 @@ impl ThreadPoolInner {
                 }
             } else {
                 if let Some(timeout) = idle_timeout {
-                    let (guard, wait_result) = self.cvar.wait_timeout(state, timeout).unwrap();
+                    let (guard, wait_result) =
+                        self.queue_cvar.wait_timeout(state, timeout).unwrap();
                     state = guard;
                     if wait_result.timed_out() && state.thread_count > state.thread_min_count {
                         info!("worker thread timed out");
+                        self.complete_cvar.notify_all();
                         break;
                     }
                 } else {
-                    state = self.cvar.wait(state).unwrap();
+                    state = self.queue_cvar.wait(state).unwrap();
                 }
             }
         }
 
         state.idle_count -= 1;
         state.thread_count -= 1;
+
+        drop(state);
         // notify the main thread in case it is waiting for shutdown
-        self.cvar.notify_one();
+        self.complete_cvar.notify_all();
         info!(
-            "worker thread shut down: {} tasks, {}",
+            "worker thread shut down after {} tasks, {}",
             tasks,
             thread::current().name().unwrap()
         );
@@ -232,7 +252,7 @@ impl ThreadPoolInner {
             {
                 let builder = state.build_thread();
                 drop(state); // in case another thread becomes idle first
-                self.cvar.notify_one();
+                self.queue_cvar.notify_one();
                 builder
                     .spawn({
                         let inner = self.clone();
@@ -247,8 +267,9 @@ impl ThreadPoolInner {
 
     fn shutdown(&self) {
         if let Ok(mut state) = self.state.lock() {
+            info!("drop inner");
             state.shutdown = true;
-            self.cvar.notify_all();
+            self.queue_cvar.notify_all();
             loop {
                 if let Some(panic) = state.panic.take() {
                     drop(state); // no need to poison the mutex as well
@@ -257,7 +278,7 @@ impl ThreadPoolInner {
                 if state.thread_count == 0 {
                     break;
                 }
-                if let Ok(guard) = self.cvar.wait(state) {
+                if let Ok(guard) = self.complete_cvar.wait(state) {
                     state = guard;
                 } else {
                     break;
@@ -295,12 +316,64 @@ impl ThreadPoolState {
     }
 }
 
-// struct ThreadScope<'pool, 's, T> {
-//     pool: &'pool ThreadPool,
-//     _marker: PhantomData<&'s T>,
-// }
+pub struct ThreadScope<'pool, 's> {
+    counter: AtomicUsize,
+    pool: &'pool ThreadPool,
+    _marker: PhantomData<&'s mut std::cell::Cell<()>>,
+}
 
-// impl<'pool, 's, T> ThreadScope<'pool, 's, T> {}
+impl<'pool, 's> ThreadScope<'pool, 's> {
+    pub fn run<F>(&mut self, f: F)
+    where
+        F: FnOnce() + Send + 's,
+    {
+        self.counter.fetch_add(1, Ordering::Relaxed);
+        let sentinel = TrackScope {
+            counter: &self.counter as *const AtomicUsize,
+            cvar: &self.pool.inner.complete_cvar as *const Condvar,
+        };
+        self.pool.run_boxed(unsafe {
+            mem::transmute(Box::new(|| {
+                f();
+                drop(sentinel);
+            }) as Runnable<'s>)
+        });
+    }
+}
+
+impl<'pool, 's> Drop for ThreadScope<'pool, 's> {
+    fn drop(&mut self) {
+        let count = self.counter.load(Ordering::Relaxed);
+        if count == 0 {
+            fence(Ordering::Acquire);
+        } else {
+            let mut state = self.pool.inner.state.lock().unwrap();
+            loop {
+                if self.counter.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                let guard = self.pool.inner.complete_cvar.wait(state).unwrap();
+                state = guard;
+            }
+        }
+    }
+}
+
+struct TrackScope {
+    counter: *const AtomicUsize,
+    cvar: *const Condvar,
+}
+
+unsafe impl Send for TrackScope {}
+
+impl Drop for TrackScope {
+    fn drop(&mut self) {
+        unsafe {
+            (&*self.counter).fetch_sub(1, Ordering::Release);
+            (&*self.cvar).notify_all();
+        }
+    }
+}
 
 // struct ScopeFuture<'s, T> {
 //     receiver: ReceiveOnce<T>,
@@ -314,7 +387,10 @@ mod tests {
     use super::ThreadPool;
     use futures_lite::future::block_on;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering::SeqCst},
+        atomic::{
+            AtomicBool, AtomicUsize,
+            Ordering::{Relaxed, SeqCst},
+        },
         Arc, Condvar, Mutex,
     };
     use std::thread;
@@ -387,5 +463,20 @@ mod tests {
             block_on(pool.unblock(|| 99)).expect("Error unwrapping unblock result"),
             99
         );
+    }
+
+    #[test]
+    fn thread_pool_scoped() {
+        tracing_subscriber::fmt::try_init().ok();
+
+        let pool = Arc::new(ThreadPool::default());
+        let result = AtomicBool::new(false);
+        pool.scoped(|scope| {
+            scope.run(|| {
+                thread::sleep(Duration::from_millis(50));
+                result.store(true, Relaxed);
+            })
+        });
+        assert_eq!(result.load(Relaxed), true);
     }
 }
