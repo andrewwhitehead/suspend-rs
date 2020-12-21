@@ -11,7 +11,7 @@ use std::{
     sync::atomic::{fence, AtomicUsize, Ordering},
 };
 
-use suspend_channel::{send_once, ReceiveOnce};
+use suspend_channel::{send_once, Incomplete, ReceiveOnce};
 use tracing::info;
 
 static DEFAULT_THREAD_NAME: &'static str = "threadpool";
@@ -149,13 +149,24 @@ impl ThreadPool {
         f(&mut scope)
     }
 
-    // pub fn async_scope<'pool, 's, F, T>(&'pool self, f: F) -> ScopeFuture<'s, T>
-    // where
-    //     F: FnOnce(&mut ThreadScope<'pool, 's, T>) -> T + Send + 's,
-    //     T: 'static,
-    // {
-    //     //
-    // }
+    pub async fn async_scoped<'pool, 's, F, T>(&'pool self, f: F) -> Result<T, Incomplete>
+    where
+        F: FnOnce(&mut ThreadScope<'pool, 's>) -> T + Send + 's,
+        T: Send + 'static,
+    {
+        let (sender, recv) = send_once();
+        let mut scope = ThreadScope {
+            counter: AtomicUsize::new(0),
+            pool: self,
+            _marker: PhantomData,
+        };
+        self.run_boxed(unsafe {
+            mem::transmute(Box::new(|| {
+                sender.send(f(&mut scope)).ok();
+            }) as Runnable<'_>)
+        });
+        recv.await
+    }
 }
 
 impl Default for ThreadPool {
@@ -372,111 +383,5 @@ impl Drop for TrackScope {
             (&*self.counter).fetch_sub(1, Ordering::Release);
             (&*self.cvar).notify_all();
         }
-    }
-}
-
-// struct ScopeFuture<'s, T> {
-//     receiver: ReceiveOnce<T>,
-//     _marker: PhantomData<&'s ()>,
-// }
-
-#[cfg(test)]
-mod tests {
-    use crate::ThreadPoolConfig;
-
-    use super::ThreadPool;
-    use futures_lite::future::block_on;
-    use std::sync::{
-        atomic::{
-            AtomicBool, AtomicUsize,
-            Ordering::{Relaxed, SeqCst},
-        },
-        Arc, Condvar, Mutex,
-    };
-    use std::thread;
-    use std::time::Duration;
-
-    #[test]
-    fn thread_pool_unbounded() {
-        tracing_subscriber::fmt::try_init().ok();
-
-        let pool = Arc::new(ThreadPool::default());
-        let count = 100;
-        let cvar = Arc::new(Condvar::new());
-        let mutex = Mutex::new(());
-        let called = Arc::new(AtomicUsize::new(0));
-        for _ in 0..count {
-            pool.run({
-                let cvar = cvar.clone();
-                let called = called.clone();
-                move || {
-                    thread::sleep(Duration::from_millis(5));
-                    called.fetch_add(1, SeqCst);
-                    cvar.notify_one();
-                }
-            });
-        }
-        let mut guard = mutex.lock().unwrap();
-        loop {
-            if called.load(SeqCst) == count {
-                break;
-            }
-            guard = cvar.wait(guard).unwrap();
-        }
-    }
-
-    #[test]
-    fn thread_pool_bounded() {
-        tracing_subscriber::fmt::try_init().ok();
-
-        let pool = Arc::new(ThreadPoolConfig::default().max_count(5).build());
-        let count = 100;
-        let cvar = Arc::new(Condvar::new());
-        let mutex = Mutex::new(());
-        let called = Arc::new(AtomicUsize::new(0));
-        for _ in 0..count {
-            pool.run({
-                let cvar = cvar.clone();
-                let called = called.clone();
-                move || {
-                    thread::sleep(Duration::from_millis(5));
-                    called.fetch_add(1, SeqCst);
-                    cvar.notify_one();
-                }
-            });
-        }
-        let mut guard = mutex.lock().unwrap();
-        loop {
-            if called.load(SeqCst) == count {
-                break;
-            }
-            guard = cvar.wait(guard).unwrap();
-        }
-    }
-
-    #[test]
-    fn thread_pool_unblock() {
-        tracing_subscriber::fmt::try_init().ok();
-
-        let pool = Arc::new(ThreadPool::default());
-        assert_eq!(
-            block_on(pool.unblock(|| 99)).expect("Error unwrapping unblock result"),
-            99
-        );
-    }
-
-    #[test]
-    fn thread_pool_scoped() {
-        tracing_subscriber::fmt::try_init().ok();
-
-        let pool = Arc::new(ThreadPool::default());
-        let result = AtomicBool::new(false);
-        pool.scoped(|scope| {
-            scope.run(|| {
-                thread::sleep(Duration::from_millis(50));
-                result.store(true, Relaxed);
-            })
-        });
-        assert_eq!(result.load(Relaxed), true);
     }
 }
