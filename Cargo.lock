@@ -179,9 +179,7 @@ dependencies = [
 
 [[package]]
 name = "maybe-cell"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11bdedfdd7cdb532e5b2636ab4db30e785268aa5d8e3a0614b463c8367c97533"
+version = "0.1.1"
 
 [[package]]
 name = "memchr"

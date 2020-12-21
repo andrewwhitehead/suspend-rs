@@ -1,0 +1,19 @@
+[package]
+name = "maybe-cell"
+version = "0.1.1"
+authors = ["Andrew Whitehead <cywolf@gmail.com>"]
+edition = "2018"
+description = "An UnsafeCell optionally containing a value, with the state externally managed"
+license = "MIT/Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/andrewwhitehead/suspend-rs/"
+categories = ["data-structures"]
+keywords = ["maybe", "maybeuninit", "no_std", "unsafecell"]
+
+[lib]
+name = "maybe_cell"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
