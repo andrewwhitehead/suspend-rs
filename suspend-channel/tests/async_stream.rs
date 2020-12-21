@@ -1,3 +1,5 @@
+#![cfg(not(miri))] // not currently supported
+
 use futures_core::FusedStream;
 use futures_lite::{future::block_on, pin, StreamExt};
 use std::sync::{

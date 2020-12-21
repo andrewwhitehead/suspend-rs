@@ -1,34 +1,40 @@
-use std::cell::UnsafeCell;
+// This currently does not fly in miri for the same reason generators have issues:
+// https://github.com/rust-lang/unsafe-code-guidelines/issues/148
+// Each poll of the AsyncStream future creates a Pin and invalidates the
+// channel pointer contained in the associated AsyncStreamScope.
+
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::ptr::{drop_in_place, NonNull};
+use std::ptr::NonNull;
 use std::task::{Context, Poll};
 
 use futures_core::{FusedStream, Stream};
 
+use crate::util::Maybe;
+
 #[inline]
-unsafe fn channel_send<T>(mut channel: NonNull<Option<T>>, value: T) {
-    if channel.as_mut().replace(value).is_some() {
+unsafe fn channel_send<T>(channel: NonNull<Maybe<Option<T>>>, value: T) {
+    if channel.as_ref().replace(Some(value)).is_some() {
         panic!("Invalid use of stream sender");
     }
 }
 
 #[inline]
-unsafe fn channel_recv<T>(mut channel: NonNull<Option<T>>) -> Option<T> {
-    channel.as_mut().take()
+unsafe fn channel_recv<T>(channel: &Maybe<Option<T>>) -> Option<T> {
+    channel.replace(None)
 }
 
 pub struct AsyncStreamScope<'a, T> {
-    channel: NonNull<Option<T>>,
-    _pd: PhantomData<&'a ()>,
+    channel: NonNull<Maybe<Option<T>>>,
+    _marker: PhantomData<&'a mut std::cell::Cell<T>>,
 }
 
 impl<T> AsyncStreamScope<'_, T> {
-    pub(crate) fn new(channel: NonNull<Option<T>>) -> Self {
+    pub(crate) unsafe fn new(channel: &mut Maybe<Option<T>>) -> Self {
         Self {
-            channel,
-            _pd: PhantomData,
+            channel: NonNull::new_unchecked(channel),
+            _marker: PhantomData,
         }
     }
 
@@ -39,8 +45,9 @@ impl<T> AsyncStreamScope<'_, T> {
         unsafe {
             channel_send(self.channel, value);
             AsyncStreamSend {
-                channel: self.channel.as_mut(),
+                channel: self.channel.as_ref(),
                 first: true,
+                _marker: PhantomData,
             }
         }
     }
@@ -50,22 +57,23 @@ impl<T> Clone for AsyncStreamScope<'_, T> {
     fn clone(&self) -> Self {
         Self {
             channel: self.channel,
-            _pd: PhantomData,
+            _marker: PhantomData,
         }
     }
 }
 
 pub struct AsyncStreamSend<'a, T> {
-    channel: &'a mut Option<T>,
+    channel: &'a Maybe<Option<T>>,
     first: bool,
+    _marker: PhantomData<&'a mut std::cell::Cell<T>>,
 }
 
 impl<T> Future for AsyncStreamSend<'_, T> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.first || self.channel.is_some() {
-            // always wait on first poll - the sender has just been filled
+        if self.first || unsafe { self.channel.as_ref().as_ref().is_some() } {
+            // always wait on first poll - the sender has just been filled.
             // remain pending while the lock is occupied
             self.first = false;
             Poll::Pending
@@ -76,9 +84,9 @@ impl<T> Future for AsyncStreamSend<'_, T> {
 }
 
 pub struct AsyncStream<'a, T, I, F> {
-    state: UnsafeCell<AsyncStreamState<I, F>>,
-    channel: UnsafeCell<Option<T>>,
-    _pd: PhantomData<&'a ()>,
+    state: Maybe<AsyncStreamState<I, F>>,
+    channel: Maybe<Option<T>>,
+    _marker: PhantomData<&'a mut std::cell::Cell<T>>,
 }
 
 enum AsyncStreamState<I, F> {
@@ -95,7 +103,7 @@ where
     AsyncStream {
         state: AsyncStreamState::Init(init).into(),
         channel: None.into(),
-        _pd: PhantomData,
+        _marker: PhantomData,
     }
 }
 
@@ -107,29 +115,27 @@ where
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            unsafe {
-                match &mut *self.state.get() {
-                    state @ AsyncStreamState::Init(_) => {
-                        let mut copy = AsyncStreamState::Complete;
-                        std::mem::swap(&mut copy, state);
-                        if let AsyncStreamState::Init(init) = copy {
-                            let fut = init(AsyncStreamScope::new(NonNull::new_unchecked(
-                                self.channel.get(),
-                            )));
-                            self.state.get().write(AsyncStreamState::Poll(fut));
-                        } else {
-                            unreachable!();
-                        }
+        unsafe {
+            let slf = Pin::get_unchecked_mut(self);
+            loop {
+                match slf.state.as_ref() {
+                    AsyncStreamState::Init(_) => {
+                        let init = match slf.state.load() {
+                            AsyncStreamState::Init(init) => init,
+                            _ => unreachable!(),
+                        };
+                        let fut = init(AsyncStreamScope::new(&mut slf.channel));
+                        slf.state.store(AsyncStreamState::Poll(fut));
                     }
-                    AsyncStreamState::Poll(fut) => {
-                        if let Poll::Ready(_) = Pin::new_unchecked(&mut *fut).poll(cx) {
-                            drop_in_place(fut);
-                            self.state.get().write(AsyncStreamState::Complete);
+                    AsyncStreamState::Poll(_) => {
+                        let poll = match slf.state.as_mut() {
+                            AsyncStreamState::Poll(poll) => Pin::new_unchecked(poll),
+                            _ => unreachable!(),
+                        };
+                        if let Poll::Ready(_) = poll.poll(cx) {
+                            slf.state.replace(AsyncStreamState::Complete);
                         } else {
-                            break if let Some(val) =
-                                channel_recv(NonNull::new_unchecked(self.channel.get()))
-                            {
+                            break if let Some(val) = channel_recv(&slf.channel) {
                                 Poll::Ready(Some(val))
                             } else {
                                 Poll::Pending
@@ -137,13 +143,20 @@ where
                         }
                     }
                     AsyncStreamState::Complete => {
-                        break Poll::Ready(channel_recv(NonNull::new_unchecked(
-                            self.channel.get(),
-                        )));
+                        break Poll::Ready(channel_recv(&slf.channel));
                     }
                 }
             }
         }
+    }
+}
+
+impl<'a, T, I, F> Drop for AsyncStream<'a, T, I, F> {
+    fn drop(&mut self) {
+        unsafe {
+            self.channel.clear();
+            self.state.clear()
+        };
     }
 }
 
@@ -153,14 +166,14 @@ where
     F: Future<Output = ()>,
 {
     fn is_terminated(&self) -> bool {
-        matches!(unsafe { &*self.state.get() }, AsyncStreamState::Complete)
+        matches!(unsafe { self.state.as_ref() }, AsyncStreamState::Complete)
     }
 }
 
 pub struct TryAsyncStreamSend<'a, T, E, F> {
-    channel: NonNull<Option<Result<T, E>>>,
+    channel: NonNull<Maybe<Option<Result<T, E>>>>,
     fut: F,
-    _pd: PhantomData<&'a ()>,
+    _marker: PhantomData<&'a mut std::cell::Cell<T>>,
 }
 
 impl<'a, T, E, F> TryAsyncStreamSend<'a, T, E, F> {
@@ -168,7 +181,7 @@ impl<'a, T, E, F> TryAsyncStreamSend<'a, T, E, F> {
         Self {
             channel: sender.channel,
             fut,
-            _pd: PhantomData,
+            _marker: PhantomData,
         }
     }
 }

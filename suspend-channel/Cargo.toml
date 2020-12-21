@@ -19,7 +19,7 @@ default = []
 
 [dependencies]
 futures-core = "0.3"
-maybe-cell = "0.1"
+maybe-cell = { version = "0.1", path = "../maybe-cell" }
 
 [dev-dependencies]
 futures-lite = "1.11"
