@@ -1,15 +1,14 @@
-use std::cell::UnsafeCell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::pin::Pin;
-use std::sync::atomic::{spin_loop_hint, AtomicU8, Ordering};
+use std::sync::atomic::{fence, spin_loop_hint, AtomicU8, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use futures_core::{FusedFuture, FusedStream, Stream};
 
 use super::error::Incomplete;
-use super::util::{BoxPtr, Maybe};
+use super::util::{BoxPtr, Maybe, MaybeCopy};
 
 const STATE_DONE: u8 = 0b0000;
 const STATE_INIT: u8 = 0b0001;
@@ -21,7 +20,12 @@ const WAKE_SEND: u8 = STATE_WAKE | STATE_LOADED;
 
 pub fn send_once<T>() -> (SendOnce<T>, ReceiveOnce<T>) {
     let channel = BoxPtr::new(Box::new(Channel::new()));
-    (SendOnce { channel }, ReceiveOnce { channel })
+    (
+        SendOnce { channel },
+        ReceiveOnce {
+            channel: channel.into(),
+        },
+    )
 }
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
@@ -31,7 +35,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
             channel: Some(channel),
         },
         Receiver {
-            channel: Some(channel),
+            channel: Some(channel).into(),
         },
     )
 }
@@ -67,15 +71,15 @@ impl<T> Channel<T> {
             }
             STATE_LOADED => {
                 // sender dropped after storing a value
-                let value = self.value.load();
+                let value = unsafe { self.value.load() };
                 self.state.store(STATE_DONE, Ordering::Relaxed);
                 return Poll::Ready((Some(value), true));
             }
             WAKE_SEND => {
                 // sender stored a value and a waker
-                let value = Some(self.value.load());
-                let send_waker = self.waker.load();
-                if self.state.swap(STATE_INIT, Ordering::Acquire) == STATE_DONE {
+                let value = Some(unsafe { self.value.load() });
+                let send_waker = unsafe { self.waker.load() };
+                if self.state.swap(STATE_INIT, Ordering::Release) == STATE_DONE {
                     // sender dropped
                     drop(send_waker);
                     return Poll::Ready((value, true));
@@ -85,7 +89,7 @@ impl<T> Channel<T> {
             }
             WAKE_RECV => {
                 // drop previous recv waker
-                self.waker.clear();
+                unsafe { self.waker.clear() };
             }
             STATE_INIT => {
                 // waiting for sender
@@ -93,10 +97,10 @@ impl<T> Channel<T> {
             _ => panic!("Invalid state"),
         }
 
-        self.waker.store(cx.waker().clone());
-        if self.state.swap(WAKE_RECV, Ordering::Acquire) == STATE_DONE {
+        unsafe { self.waker.store(cx.waker().clone()) };
+        if self.state.swap(WAKE_RECV, Ordering::Release) == STATE_DONE {
             // sender dropped
-            self.waker.clear();
+            unsafe { self.waker.clear() };
             return Poll::Ready((None, true));
         }
         Poll::Pending
@@ -121,7 +125,7 @@ impl<T> Channel<T> {
                 }
                 STATE_LOADED => {
                     // sender dropped after storing a value
-                    let value = self.value.load();
+                    let value = unsafe { self.value.load() };
                     self.state.store(STATE_DONE, Ordering::Relaxed);
                     return Poll::Ready((Some(value), true));
                 }
@@ -133,9 +137,9 @@ impl<T> Channel<T> {
                         locked = true;
                         continue;
                     }
-                    let value = Some(self.value.load());
-                    let send_waker = self.waker.load();
-                    if self.state.swap(STATE_INIT, Ordering::Acquire) == STATE_DONE {
+                    let value = Some(unsafe { self.value.load() });
+                    let send_waker = unsafe { self.waker.load() };
+                    if self.state.swap(STATE_INIT, Ordering::Release) == STATE_DONE {
                         // sender dropped
                         drop(send_waker);
                         return Poll::Ready((value, true));
@@ -165,17 +169,17 @@ impl<T> Channel<T> {
             }
             STATE_LOADED => {
                 // sender loaded a value and dropped
-                (Some(self.value.load()), true)
+                (Some(unsafe { self.value.load() }), true)
             }
             WAKE_SEND => {
                 // sender loaded a value, waiting for receiver
                 // the state is now STATE_LOADED
-                self.waker.load().wake();
+                unsafe { self.waker.load() }.wake();
                 (None, false)
             }
             WAKE_RECV => {
                 // drop previous waker
-                self.waker.clear();
+                unsafe { self.waker.clear() };
                 (None, false)
             }
             _ => panic!("Invalid state"),
@@ -229,25 +233,25 @@ impl<T> Channel<T> {
             }
             WAKE_RECV => {
                 // receiver stored a waker
-                Some(self.waker.load())
+                Some(unsafe { self.waker.load() })
             }
             _ => panic!("Invalid state"),
         };
 
-        self.value.store(value);
+        unsafe { self.value.store(value) };
         let state = if let Some(cx) = cx {
-            self.waker.store(cx.waker().clone());
+            unsafe { self.waker.store(cx.waker().clone()) };
             WAKE_SEND
         } else {
             STATE_LOADED
         };
-        if self.state.swap(state, Ordering::Acquire) == STATE_DONE {
+        if self.state.swap(state, Ordering::Release) == STATE_DONE {
             // receiver dropped
             drop(recv_waker);
             if state == WAKE_SEND {
-                self.waker.clear();
+                unsafe { self.waker.clear() };
             }
-            return Err((self.value.load(), true));
+            return Err((unsafe { self.value.load() }, true));
         }
         recv_waker.map(Waker::wake);
         Ok(())
@@ -266,12 +270,11 @@ impl<T> Channel<T> {
             }
             STATE_LOADED => {
                 // receiver dropped and left the result
-                Poll::Ready((Some(self.value.load()), true))
+                Poll::Ready((Some(unsafe { self.value.load() }), true))
             }
             WAKE_SEND => {
                 // still waiting for receiver
-                self.waker.clear();
-                self.waker.store(cx.waker().clone());
+                unsafe { self.waker.replace(cx.waker().clone()) };
                 self.state.store(WAKE_SEND, Ordering::Release);
                 Poll::Pending
             }
@@ -296,7 +299,7 @@ impl<T> Channel<T> {
             }
             WAKE_RECV => {
                 // receiver loaded a waker
-                self.waker.load().wake();
+                unsafe { self.waker.load() }.wake();
                 false
             }
             _ => panic!("Invalid state"),
@@ -320,7 +323,7 @@ impl<T> Channel<T> {
             }
             WAKE_SEND => {
                 // still waiting for receiver
-                self.waker.clear();
+                unsafe { self.waker.clear() };
                 self.state.store(STATE_LOADED, Ordering::Release);
                 false
             }
@@ -346,8 +349,9 @@ impl<T> Channel<T> {
     #[inline]
     fn wait_for_lock(&mut self) -> u8 {
         loop {
-            let prev = self.state.fetch_or(STATE_LOCKED, Ordering::AcqRel);
+            let prev = self.state.fetch_or(STATE_LOCKED, Ordering::Relaxed);
             if prev & STATE_LOCKED == 0 {
+                fence(Ordering::Acquire);
                 return prev;
             }
             spin_loop_hint();
@@ -373,15 +377,19 @@ impl<T> Channel<T> {
 }
 
 pub struct TrackSend<'a, T> {
-    channel: Option<BoxPtr<Channel<T>>>,
-    value: UnsafeCell<Option<T>>,
+    channel: MaybeCopy<Option<BoxPtr<Channel<T>>>>,
+    value: Maybe<Option<T>>,
     drops: bool,
-    _pd: PhantomData<&'a ()>,
+    _pd: PhantomData<&'a mut T>,
 }
 
 impl<T> Drop for TrackSend<'_, T> {
     fn drop(&mut self) {
-        self.channel.map(|mut c| c.cancel_send_poll());
+        unsafe {
+            let channel = self.channel.load();
+            channel.map(|mut c| c.cancel_send_poll());
+            self.value.clear();
+        }
     }
 }
 
@@ -389,13 +397,13 @@ impl<T> Future for TrackSend<'_, T> {
     type Output = Result<(), T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(value) = unsafe { &mut *self.value.get() }.take() {
-            if let Some(mut channel) = self.channel {
+        if let Some(value) = unsafe { self.value.replace(None) } {
+            if let Some(mut channel) = unsafe { self.channel.load() } {
                 if let Err((value, dropped)) = channel.send(value, Some(cx)) {
                     if dropped && self.drops {
                         drop(channel.into_box());
                     }
-                    unsafe { self.map_unchecked_mut(|s| &mut s.channel) }.take();
+                    unsafe { self.channel.store(None) };
                     Poll::Ready(Err(value))
                 } else {
                     Poll::Pending
@@ -403,12 +411,12 @@ impl<T> Future for TrackSend<'_, T> {
             } else {
                 Poll::Ready(Err(value))
             }
-        } else if let Some(mut channel) = self.channel {
+        } else if let Some(mut channel) = unsafe { self.channel.load() } {
             channel.poll_send(cx).map(|(result, dropped)| {
                 if dropped && self.drops {
                     drop(channel.into_box());
                 }
-                unsafe { self.map_unchecked_mut(|s| &mut s.channel) }.take();
+                unsafe { self.channel.store(None) };
                 result.map(Err).unwrap_or(Ok(()))
             })
         } else {
@@ -419,7 +427,7 @@ impl<T> Future for TrackSend<'_, T> {
 
 impl<T> FusedFuture for TrackSend<'_, T> {
     fn is_terminated(&self) -> bool {
-        self.channel.is_none()
+        unsafe { self.channel.as_ref() }.is_none()
     }
 }
 
@@ -452,7 +460,7 @@ impl<T> SendOnce<T> {
     pub fn track_send(self, value: T) -> TrackSend<'static, T> {
         let channel = ManuallyDrop::new(self).channel;
         TrackSend {
-            channel: Some(channel),
+            channel: Some(channel).into(),
             value: Some(value).into(),
             drops: true,
             _pd: PhantomData,
@@ -469,7 +477,7 @@ impl<T> Drop for SendOnce<T> {
 }
 
 pub struct ReceiveOnce<T> {
-    channel: BoxPtr<Channel<T>>,
+    channel: MaybeCopy<BoxPtr<Channel<T>>>,
 }
 
 unsafe impl<T: Send> Send for ReceiveOnce<T> {}
@@ -477,7 +485,7 @@ unsafe impl<T: Send> Sync for ReceiveOnce<T> {}
 
 impl<T> ReceiveOnce<T> {
     pub fn cancel(self) -> Option<T> {
-        let mut channel = ManuallyDrop::new(self).channel;
+        let mut channel = unsafe { ManuallyDrop::new(self).channel.load() };
         let (result, dropped) = channel.cancel_recv();
         if dropped {
             drop(channel.into_box());
@@ -485,16 +493,20 @@ impl<T> ReceiveOnce<T> {
         result
     }
 
-    pub fn try_recv(mut self) -> Result<Result<T, Incomplete>, Self> {
-        match self.channel.try_recv() {
+    pub fn try_recv(self) -> Result<Result<T, Incomplete>, Self> {
+        let mut channel = unsafe { self.channel.load() };
+        match channel.try_recv() {
             Poll::Ready((result, dropped)) => {
-                let slf = ManuallyDrop::new(self);
+                let _ = ManuallyDrop::new(self);
                 if dropped {
-                    drop(slf.channel.into_box());
+                    drop(channel.into_box());
                 }
                 Ok(result.ok_or(Incomplete))
             }
-            Poll::Pending => Err(self),
+            Poll::Pending => {
+                unsafe { self.channel.store(channel) };
+                Err(self)
+            }
         }
     }
 
@@ -530,8 +542,9 @@ impl<T> ReceiveOnce<T> {
 
 impl<T> Drop for ReceiveOnce<T> {
     fn drop(&mut self) {
-        if let (_, true) = self.channel.cancel_recv() {
-            drop(self.channel.into_box());
+        let mut channel = unsafe { self.channel.load() };
+        if let (_, true) = channel.cancel_recv() {
+            drop(channel.into_box());
         }
     }
 }
@@ -539,28 +552,30 @@ impl<T> Drop for ReceiveOnce<T> {
 impl<T> Future for ReceiveOnce<T> {
     type Output = Result<T, Incomplete>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        self.channel.poll_recv(cx).map(|r| r.0.ok_or(Incomplete))
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let mut channel = unsafe { self.channel.load() };
+        channel.poll_recv(cx).map(|r| r.0.ok_or(Incomplete))
     }
 }
 
 impl<T> FusedFuture for ReceiveOnce<T> {
     fn is_terminated(&self) -> bool {
-        self.channel.is_done()
+        unsafe { self.channel.as_ref() }.is_done()
     }
 }
 
 impl<T> Stream for ReceiveOnce<T> {
     type Item = T;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        self.channel.poll_recv(cx).map(|r| r.0)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let mut channel = unsafe { self.channel.load() };
+        channel.poll_recv(cx).map(|r| r.0)
     }
 }
 
 impl<T> FusedStream for ReceiveOnce<T> {
     fn is_terminated(&self) -> bool {
-        self.channel.is_done()
+        unsafe { self.channel.as_ref() }.is_done()
     }
 }
 
@@ -582,7 +597,7 @@ impl<T> Sender<T> {
     /// Dispatch the result and consume the `SendOnce`.
     pub fn send(&mut self, value: T) -> TrackSend<'_, T> {
         TrackSend {
-            channel: self.channel,
+            channel: self.channel.into(),
             value: Some(value).into(),
             drops: false,
             _pd: PhantomData,
@@ -615,7 +630,7 @@ impl<T> Drop for Sender<T> {
 }
 
 pub struct Receiver<T> {
-    channel: Option<BoxPtr<Channel<T>>>,
+    channel: MaybeCopy<Option<BoxPtr<Channel<T>>>>,
 }
 
 unsafe impl<T: Send> Send for Receiver<T> {}
@@ -623,7 +638,7 @@ unsafe impl<T: Send> Sync for Receiver<T> {}
 
 impl<T> Receiver<T> {
     pub fn cancel(self) -> Option<T> {
-        if let Some(mut channel) = ManuallyDrop::new(self).channel {
+        if let Some(mut channel) = unsafe { ManuallyDrop::new(self).channel.load() } {
             let (result, dropped) = channel.cancel_recv();
             if dropped {
                 drop(channel.into_box());
@@ -635,11 +650,13 @@ impl<T> Receiver<T> {
     }
 
     pub fn try_recv(&mut self) -> Poll<Option<T>> {
-        if let Some(mut channel) = self.channel {
+        if let Some(mut channel) = unsafe { self.channel.load() } {
             channel.try_recv().map(|(result, dropped)| {
-                if dropped {
-                    drop(channel.into_box());
-                    self.channel.take();
+                if dropped || result.is_some() {
+                    if dropped {
+                        drop(channel.into_box());
+                        unsafe { self.channel.store(None) };
+                    }
                 }
                 result
             })
@@ -681,7 +698,7 @@ impl<T> Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        if let Some(mut channel) = self.channel {
+        if let Some(mut channel) = unsafe { self.channel.load() } {
             if channel.cancel_recv().1 {
                 drop(channel.into_box());
             }
@@ -693,11 +710,11 @@ impl<T> Stream for Receiver<T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<T>> {
-        if let Some(mut channel) = self.channel {
+        if let Some(mut channel) = unsafe { self.channel.load() } {
             channel.poll_recv(cx).map(|(result, dropped)| {
                 if dropped {
                     drop(channel.into_box());
-                    unsafe { self.map_unchecked_mut(|s| &mut s.channel) }.take();
+                    unsafe { self.channel.store(None) };
                 }
                 result
             })
@@ -709,6 +726,8 @@ impl<T> Stream for Receiver<T> {
 
 impl<T> FusedStream for Receiver<T> {
     fn is_terminated(&self) -> bool {
-        self.channel.map(|c| c.is_done()).unwrap_or(true)
+        unsafe { self.channel.load() }
+            .map(|c| c.is_done())
+            .unwrap_or(true)
     }
 }

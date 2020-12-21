@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 
@@ -7,7 +9,7 @@ pub use maybe_cell::checked::{Maybe, MaybeCopy};
 pub use maybe_cell::unchecked::{Maybe, MaybeCopy};
 
 #[repr(transparent)]
-pub struct BoxPtr<T: ?Sized>(NonNull<T>);
+pub struct BoxPtr<T: ?Sized>(NonNull<T>, PhantomData<Cell<T>>);
 
 impl<T: ?Sized> BoxPtr<T> {
     #[inline]
@@ -19,7 +21,7 @@ impl<T: ?Sized> BoxPtr<T> {
     #[inline]
     pub unsafe fn new_unchecked(ptr: *mut T) -> Self {
         debug_assert!(!ptr.is_null());
-        Self(NonNull::new_unchecked(ptr))
+        Self(NonNull::new_unchecked(ptr), PhantomData)
     }
 
     // #[inline]
@@ -34,7 +36,7 @@ impl<T: ?Sized> BoxPtr<T> {
 
 impl<T> Clone for BoxPtr<T> {
     fn clone(&self) -> Self {
-        Self(self.0)
+        Self(self.0, PhantomData)
     }
 }
 

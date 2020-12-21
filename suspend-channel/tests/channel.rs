@@ -70,19 +70,6 @@ fn channel_send_receive_poll() {
 }
 
 #[test]
-fn channel_dispatch_receive_multiple() {
-    let (mut sender, mut receiver) = channel::<i32>();
-    thread::spawn(move || {
-        for idx in 0..10 {
-            assert_eq!(block_on(sender.send(idx)), Ok(()));
-        }
-    });
-    for idx in 0..10 {
-        assert_eq!(block_on(receiver.next()), Some(idx));
-    }
-}
-
-#[test]
 fn channel_send_receive_block() {
     let (sender, mut receiver) = channel();
     assert_eq!(sender.into_send(1u32), Ok(()));
@@ -91,15 +78,39 @@ fn channel_send_receive_block() {
 
 #[test]
 fn channel_send_receive_thread() {
+    let (sender, mut receiver) = channel();
+    let ta = thread::spawn(move || sender.into_send(1u32).unwrap());
+    assert_eq!(block_on(receiver.next()), Some(1u32));
+    ta.join().unwrap();
+}
+
+#[test]
+fn channel_send_receive_forward_thread() {
     let (sender0, mut receiver0) = channel();
     let (sender1, mut receiver1) = channel();
-    thread::spawn(move || {
+    let ta = thread::spawn(move || {
         sender1
             .into_send(block_on(receiver0.next()).unwrap())
             .unwrap()
     });
-    thread::spawn(move || sender0.into_send(1u32).unwrap());
+    let tb = thread::spawn(move || sender0.into_send(1u32).unwrap());
     assert_eq!(block_on(receiver1.next()), Some(1u32));
+    ta.join().unwrap();
+    tb.join().unwrap();
+}
+
+#[test]
+fn channel_send_receive_thread_multiple() {
+    let (mut sender, mut receiver) = channel::<i32>();
+    let ops = thread::spawn(move || {
+        for idx in 0..10 {
+            assert_eq!(block_on(sender.send(idx)), Ok(()));
+        }
+    });
+    for idx in 0..10 {
+        assert_eq!(block_on(receiver.next()), Some(idx));
+    }
+    ops.join().unwrap();
 }
 
 #[test]
