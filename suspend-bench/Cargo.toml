@@ -1,0 +1,21 @@
+[package]
+name = "suspend-bench"
+version = "0.1.0"
+authors = ["Andrew Whitehead <cywolf@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+criterion = "0.3"
+futures-channel = "0.3"
+futures-lite = "1.11"
+oneshot_rs = { package = "oneshot", version = "0.1.2" }
+suspend-channel = { path = "../suspend-channel" }
+suspend-exec = { path = "../suspend-exec" }
+
+[[bench]]
+name = "oneshot_send"
+harness = false
+
+[[bench]]
+name = "oneshot_thread"
+harness = false
