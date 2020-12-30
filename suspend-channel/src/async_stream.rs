@@ -3,11 +3,13 @@
 // Each poll of the AsyncStream future creates a Pin and invalidates the
 // channel pointer contained in the associated AsyncStreamScope.
 
-use std::future::Future;
-use std::marker::PhantomData;
-use std::pin::Pin;
-use std::ptr::NonNull;
-use std::task::{Context, Poll};
+use core::{
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    ptr::NonNull,
+    task::{Context, Poll},
+};
 
 use futures_core::{FusedStream, Stream};
 
@@ -25,6 +27,8 @@ unsafe fn channel_recv<T>(channel: &Maybe<Option<T>>) -> Option<T> {
     channel.replace(None)
 }
 
+/// A utility class for providing values to the stream.
+#[derive(Debug)]
 pub struct AsyncStreamScope<'a, T> {
     channel: NonNull<Maybe<Option<T>>>,
     _marker: PhantomData<&'a mut std::cell::Cell<T>>,
@@ -38,6 +42,8 @@ impl<T> AsyncStreamScope<'_, T> {
         }
     }
 
+    /// Dispatch a value to the stream, returning a [`Future`] which will resolve
+    /// when the value has been received.
     pub fn send<'a, 'b>(&'b mut self, value: T) -> AsyncStreamSend<'a, T>
     where
         'b: 'a,
@@ -62,6 +68,8 @@ impl<T> Clone for AsyncStreamScope<'_, T> {
     }
 }
 
+/// A [`Future`] which resolves when the dispatched value has been received.
+#[derive(Debug)]
 pub struct AsyncStreamSend<'a, T> {
     channel: &'a Maybe<Option<T>>,
     first: bool,
@@ -83,18 +91,24 @@ impl<T> Future for AsyncStreamSend<'_, T> {
     }
 }
 
+unsafe impl<T> Send for AsyncStreamSend<'_, T> {}
+
+/// A [`Stream`] implementation wrapping a generator `Future`.
+#[derive(Debug)]
 pub struct AsyncStream<'a, T, I, F> {
     state: Maybe<AsyncStreamState<I, F>>,
     channel: Maybe<Option<T>>,
     _marker: PhantomData<&'a mut std::cell::Cell<T>>,
 }
 
+#[derive(Debug)]
 enum AsyncStreamState<I, F> {
     Init(I),
     Poll(F),
     Complete,
 }
 
+/// Construct a new [`AsyncStream`] from a generator function.
 pub fn make_stream<'a, T, I, F>(init: I) -> AsyncStream<'a, T, I, F>
 where
     I: FnOnce(AsyncStreamScope<'a, T>) -> F + 'a,
@@ -170,13 +184,18 @@ where
     }
 }
 
+/// A [`Future`] which resolves when the dispatched value has been received.
+#[derive(Debug)]
 pub struct TryAsyncStreamSend<'a, T, E, F> {
     channel: NonNull<Maybe<Option<Result<T, E>>>>,
     fut: F,
     _marker: PhantomData<&'a mut std::cell::Cell<T>>,
 }
 
+unsafe impl<T, E, F> Send for TryAsyncStreamSend<'_, T, E, F> {}
+
 impl<'a, T, E, F> TryAsyncStreamSend<'a, T, E, F> {
+    /// Construct a new `TryAsyncStreamSend` from an `AsyncStreamScope`.
     pub fn new(sender: AsyncStreamScope<'a, Result<T, E>>, fut: F) -> Self {
         Self {
             channel: sender.channel,
@@ -204,6 +223,7 @@ where
     }
 }
 
+/// A macro for constructing an async stream from a generator function.
 #[macro_export]
 macro_rules! stream {
     {$($block:tt)*} => {
@@ -219,6 +239,8 @@ macro_rules! stream {
     }
 }
 
+/// A macro for constructing an async stream of `Result<T, E>` from a generator
+/// function.
 #[macro_export]
 macro_rules! try_stream {
     {$($block:tt)*} => {

@@ -8,10 +8,10 @@ use std::task::{Context, Poll};
 use std::thread;
 
 use futures_core::FusedFuture;
-use futures_lite::{future::block_on, StreamExt};
 use futures_task::{waker_ref, ArcWake};
 
-use suspend_channel::{send_once, Incomplete};
+use suspend_channel::{send_once, Incomplete, StreamNext};
+use suspend_core::listen::block_on;
 
 mod utils;
 use utils::TestDrop;
@@ -75,6 +75,13 @@ fn send_once_receive_block_on() {
     let (sender, receiver) = send_once();
     assert_eq!(sender.send(1u32), Ok(()));
     assert_eq!(block_on(receiver), Ok(1u32));
+}
+
+#[test]
+fn send_once_receive_wait() {
+    let (sender, receiver) = send_once();
+    assert_eq!(sender.send(1u32), Ok(()));
+    assert_eq!(receiver.wait(), Ok(1u32));
 }
 
 #[test]

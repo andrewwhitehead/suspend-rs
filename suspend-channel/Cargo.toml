@@ -4,11 +4,12 @@ version = "0.1.0"
 authors = ["Andrew Whitehead <cywolf@gmail.com>"]
 edition = "2018"
 description = ""
-license = "MIT"
+license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/andrewwhitehead/suspend-rs/"
+documentation = "https://docs.rs/suspend-channel"
 categories = ["asynchronous", "concurrency", "data-structures"]
-keywords = ["park", "future", "stream", "thread", "waker"]
+keywords = ["channel", "future", "stream"]
 
 [lib]
 name = "suspend_channel"
@@ -20,7 +21,7 @@ default = []
 [dependencies]
 futures-core = "0.3"
 maybe-cell = { version = "0.1", path = "../maybe-cell" }
+suspend-core = { version = "0.1", path = "../suspend-core" }
 
 [dev-dependencies]
-futures-lite = "1.11"
 futures-task = "0.3"

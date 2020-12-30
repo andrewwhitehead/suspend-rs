@@ -7,10 +7,10 @@ use std::task::{Context, Poll};
 use std::thread;
 
 use futures_core::{FusedStream, Stream};
-use futures_lite::{future::block_on, StreamExt};
 use futures_task::{waker_ref, ArcWake};
 
-use suspend_channel::channel;
+use suspend_channel::{channel, StreamNext};
+use suspend_core::listen::block_on;
 
 mod utils;
 use utils::TestDrop;
@@ -70,10 +70,17 @@ fn channel_send_receive_poll() {
 }
 
 #[test]
-fn channel_send_receive_block() {
+fn channel_send_receive_block_on() {
     let (sender, mut receiver) = channel();
     assert_eq!(sender.into_send(1u32), Ok(()));
     assert_eq!(block_on(receiver.next()), Some(1u32));
+}
+
+#[test]
+fn channel_send_receive_wait_next() {
+    let (sender, mut receiver) = channel();
+    assert_eq!(sender.into_send(1u32), Ok(()));
+    assert_eq!(receiver.wait_next(), Some(1u32));
 }
 
 #[test]
@@ -165,6 +172,13 @@ fn channel_receiver_block_on() {
     let (sender, mut receiver) = channel::<u32>();
     sender.into_send(5).unwrap();
     assert_eq!(block_on(receiver.next()), Some(5));
+}
+
+#[test]
+fn channel_receiver_wait_next() {
+    let (sender, mut receiver) = channel::<u32>();
+    sender.into_send(5).unwrap();
+    assert_eq!(receiver.wait_next(), Some(5));
 }
 
 #[test]

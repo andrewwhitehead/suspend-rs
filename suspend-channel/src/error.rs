@@ -1,8 +1,8 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-/// An error indicating that the [`TaskSender`](crate::task::TaskSender) side
-/// of a one-shot channel was dropped without sending a result.
+/// An error indicating that a receive operation could not be completed because
+/// the sender was dropped.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Incomplete;
 
@@ -14,9 +14,7 @@ impl Display for Incomplete {
 
 impl Error for Incomplete {}
 
-/// A timeout error which may be returned when waiting for a
-/// [`Listener`](crate::Listener), [`Task`](crate::task::Task) or
-/// [`Iter`](crate::iter::Iter) with a given expiry time.
+/// An error returned when a timeout has expired.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TimedOut;
 

@@ -1,12 +1,13 @@
 #![cfg(not(miri))] // not currently supported
 
 use futures_core::FusedStream;
-use futures_lite::{future::block_on, pin, StreamExt};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use suspend_channel::{make_stream, stream, try_stream};
+
+use suspend_channel::{make_stream, stream, try_stream, StreamNext};
+use suspend_core::{listen::block_on, pin};
 
 #[test]
 fn non_macro() {
