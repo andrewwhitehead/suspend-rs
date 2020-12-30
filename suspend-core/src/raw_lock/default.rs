@@ -1,6 +1,5 @@
 use std::{
     fmt::{self, Debug, Formatter},
-    ptr,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Condvar, Mutex, PoisonError,
@@ -8,7 +7,7 @@ use std::{
     time::Instant,
 };
 
-use super::{Guard, HasGuard, LockError, RawLock};
+use super::{LockError, RawLock};
 
 impl<T> From<PoisonError<T>> for LockError {
     fn from(_: PoisonError<T>) -> Self {
@@ -38,35 +37,29 @@ impl RawLock for LockImpl {
     }
 
     #[inline]
-    fn lock<'s>(&'s self) -> Result<Guard<'s, Self>, LockError> {
+    fn acquire(&self) -> Result<(), LockError> {
         if self.state.fetch_or(STATE_HELD, Ordering::Acquire) & STATE_HELD == 0 {
-            Ok(Guard::new(GuardImpl(self, true)))
+            Ok(())
         } else {
             Err(LockError::Contended)
         }
     }
 
     #[inline]
-    fn lock_mut<'s>(&'s mut self) -> Guard<'s, Self> {
-        Guard(GuardImpl(self, false))
+    fn release(&self) -> Result<(), LockError> {
+        let found = self.state.fetch_and(!STATE_HELD, Ordering::Release);
+        debug_assert!(found & STATE_HELD != 0);
+        Ok(())
     }
 
-    fn park<'s>(
-        &self,
-        guard: Guard<'s, Self>,
-        timeout: Option<Instant>,
-    ) -> Result<(Guard<'s, Self>, bool), LockError> {
-        if !ptr::eq(self, (guard.0).0) {
-            return Err(LockError::Invalid);
-        }
-
+    fn park(&self, timeout: Option<Instant>) -> Result<bool, LockError> {
         // relaxed ordering is suffient, we will check again after acquiring the mutex
         let state = self.state.load(Ordering::Relaxed);
         if state & STATE_NOTIFY != 0 {
             // consume notification
             let found = self.state.swap(state & !STATE_NOTIFY, Ordering::Acquire);
             debug_assert_eq!(found, state);
-            return Ok((guard, true));
+            return Ok(true);
         }
 
         let mut mlock = self.mutex.lock()?;
@@ -82,7 +75,7 @@ impl RawLock for LockImpl {
                 drop(mlock);
                 let found = self.state.swap(state & !STATE_NOTIFY, Ordering::Acquire);
                 debug_assert_eq!(found, state);
-                return Ok((guard, true));
+                return Ok(true);
             }
             _ => panic!("Invalid lock state update"),
         }
@@ -113,7 +106,7 @@ impl RawLock for LockImpl {
                     .state
                     .swap(state & !(STATE_PARK | STATE_NOTIFY), Ordering::Acquire);
                 drop(mlock);
-                return Ok((guard, found & STATE_NOTIFY != 0));
+                return Ok(found & STATE_NOTIFY != 0);
             }
         }
     }
@@ -138,21 +131,5 @@ impl RawLock for LockImpl {
 impl Debug for LockImpl {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("default::LockImpl").finish()
-    }
-}
-
-impl<'s> HasGuard<'s> for LockImpl {
-    type Lock = LockImpl;
-    type Guard = GuardImpl<'s>;
-}
-
-#[derive(Debug)]
-pub struct GuardImpl<'s>(&'s LockImpl, bool);
-
-impl<'s> Drop for GuardImpl<'s> {
-    fn drop(&mut self) {
-        if self.1 {
-            self.0.state.fetch_and(!STATE_HELD, Ordering::Release);
-        }
     }
 }

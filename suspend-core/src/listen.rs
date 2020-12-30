@@ -3,6 +3,7 @@
 use core::{
     cell::RefCell,
     future::Future,
+    marker::PhantomData,
     pin::Pin,
     ptr::NonNull,
     sync::atomic::{AtomicUsize, Ordering},
@@ -10,7 +11,7 @@ use core::{
 };
 use std::time::Instant;
 
-use super::raw_lock::{Guard, LockError, NativeLock, RawLock};
+use super::raw_lock::{LockError, NativeLock, RawLock};
 use super::types::Expiry;
 
 thread_local! {
@@ -81,12 +82,12 @@ fn with_listener<T>(f: impl FnOnce(&mut ListenerGuard<'_>, &Waker) -> T) -> T {
     THREAD_LISTEN.with(|cached| {
         if let Ok(mut borrowed) = cached.try_borrow_mut() {
             let (listen, waker) = &mut *borrowed;
-            let mut guard = listen.lock_mut();
+            let mut guard = listen.get_mut();
             f(&mut guard, waker)
         } else {
             // thread listener in use, create a new one
             let mut listen = Listener::new();
-            let mut guard = listen.lock_mut();
+            let mut guard = listen.get_mut();
             let waker = guard.waker();
             f(&mut guard, &waker)
         }
@@ -112,23 +113,17 @@ impl Listener {
     /// This will fail with `LockError::Contended` if the `Listener` has
     /// already been locked.
     #[inline]
-    pub fn lock(&self) -> Result<ListenerGuard<'_>, LockError> {
-        unsafe {
-            let guard = self.inner.as_ref().lock.lock()?;
-            Ok(ListenerGuard::new(guard, self.inner))
-        }
+    pub fn acquire(&self) -> Result<ListenerGuard<'_>, LockError> {
+        unsafe { self.inner.as_ref() }.lock.acquire()?;
+        Ok(ListenerGuard::new(self.inner, true))
     }
 
     /// Create a [`ListenerGuard`] from a mutable reference to the `Listener`.
     /// This is more efficient than [`Listener::lock()`] because the type system
     /// ensures that no other references are in use.
     #[inline]
-    pub fn lock_mut(&mut self) -> ListenerGuard<'_> {
-        unsafe {
-            let inner = self.inner;
-            let guard = self.inner.as_mut().lock.lock_mut();
-            ListenerGuard::new(guard, inner)
-        }
+    pub fn get_mut(&mut self) -> ListenerGuard<'_> {
+        ListenerGuard::new(self.inner, false)
     }
 
     /// Notify the `Listener` instance. This method returns `true` if the
@@ -238,16 +233,18 @@ impl Inner {
 /// An exclusive guard around a [`Listener`] instance.
 #[derive(Debug)]
 pub struct ListenerGuard<'s> {
-    guard: Option<Guard<'s, NativeLock>>,
     inner: NonNull<Inner>,
+    release: bool,
+    _marker: PhantomData<&'s ()>,
 }
 
 impl<'s> ListenerGuard<'s> {
     #[inline]
-    pub(crate) fn new(guard: Guard<'s, NativeLock>, inner: NonNull<Inner>) -> Self {
+    pub(crate) fn new(inner: NonNull<Inner>, release: bool) -> Self {
         Self {
-            guard: Some(guard),
             inner,
+            release,
+            _marker: PhantomData,
         }
     }
 
@@ -272,13 +269,16 @@ impl<'s> ListenerGuard<'s> {
     /// return immediately. The return value indicates whether a notification was
     /// consumed, returning `false` in the case of a timeout.
     pub fn wait(&mut self, timeout: impl Expiry) -> Result<bool, LockError> {
-        if let Some(guard) = self.guard.take() {
-            let inner = unsafe { self.inner.as_ref() };
-            let (guard, notified) = inner.lock.park(guard, timeout.into_expire())?;
-            self.guard.replace(guard);
-            Ok(notified)
-        } else {
-            Err(LockError::Invalid)
+        unsafe { self.inner.as_ref() }
+            .lock
+            .park(timeout.into_expire())
+    }
+}
+
+impl Drop for ListenerGuard<'_> {
+    fn drop(&mut self) {
+        if self.release {
+            unsafe { self.inner.as_ref() }.lock.release().unwrap();
         }
     }
 }

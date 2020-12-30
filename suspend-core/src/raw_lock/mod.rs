@@ -21,20 +21,14 @@ cfg_if::cfg_if! {
     }
 }
 
-pub trait RawLock:
-    'static + Debug + Sized + Send + Sync + for<'s> HasGuard<'s, Lock = Self>
-{
+pub trait RawLock: 'static + Debug + Sized + Send + Sync {
     fn new() -> Self;
 
-    fn lock<'s>(&'s self) -> Result<Guard<'s, Self>, LockError>;
+    fn acquire(&self) -> Result<(), LockError>;
 
-    fn lock_mut<'s>(&'s mut self) -> Guard<'s, Self>;
+    fn release(&self) -> Result<(), LockError>;
 
-    fn park<'s>(
-        &self,
-        guard: Guard<'s, Self>,
-        timeout: Option<Instant>,
-    ) -> Result<(Guard<'s, Self>, bool), LockError>;
+    fn park(&self, timeout: Option<Instant>) -> Result<bool, LockError>;
 
     fn notify(&self) -> bool;
 }
@@ -53,23 +47,6 @@ impl Display for LockError {
     }
 }
 
-// This can be removed when GATs are available
-pub trait HasGuard<'s> {
-    type Lock;
-    type Guard: Debug;
-}
-
-#[derive(Debug)]
-#[repr(transparent)]
-pub struct Guard<'s, L: HasGuard<'s, Lock = L>>(L::Guard);
-
-impl<'s, L: HasGuard<'s, Lock = L>> Guard<'s, L> {
-    #[inline]
-    pub(crate) fn new(inner: L::Guard) -> Self {
-        Self(inner)
-    }
-}
-
 macro_rules! parker_tests {
     ($mod:ident, $cls:ident) => {
         #[cfg(test)]
@@ -81,19 +58,19 @@ macro_rules! parker_tests {
             use std::time::Duration;
 
             #[test]
-            fn lock_contend() {
+            fn acquire_contend() {
                 let lock = $cls::new();
-                let _guard = lock.lock().expect("Error locking");
-                lock.lock().expect_err("Lock should fail");
+                lock.acquire().expect("Error locking");
+                lock.acquire().expect_err("Lock should fail");
             }
 
             #[test]
-            fn lock_contend_threaded() {
+            fn acquire_contend_threaded() {
                 let lock = Arc::new($cls::new());
                 let lock_copy = Arc::clone(&lock);
-                let _guard = lock.lock().expect("Error locking");
+                lock.acquire().expect("Error locking");
                 thread::spawn(move || {
-                    lock_copy.lock().expect_err("Lock should fail");
+                    lock_copy.acquire().expect_err("Lock should fail");
                 })
                 .join()
                 .unwrap();
@@ -103,10 +80,11 @@ macro_rules! parker_tests {
             fn park_notify() {
                 let lock = $cls::new();
                 for _ in 0..5 {
-                    let guard = lock.lock().expect("Error locking");
+                    lock.acquire().expect("Error locking");
                     assert_eq!(lock.notify(), true, "Expected notify to succeed");
-                    let (_, notified) = lock.park(guard, None).expect("Error parking");
+                    let notified = lock.park(None).expect("Error parking");
                     assert_eq!(notified, true, "Expected notified before park");
+                    lock.release().expect("Error unlocking");
                 }
             }
 
@@ -115,14 +93,15 @@ macro_rules! parker_tests {
                 let lock = Arc::new($cls::new());
                 for _ in 0..5 {
                     let lock_copy = Arc::clone(&lock);
-                    let guard = lock.lock().expect("Error locking");
+                    lock.acquire().expect("Error locking");
                     let th = thread::spawn(move || {
                         lock_copy.notify();
                     });
                     let expiry = Duration::from_millis(200).into_expire();
-                    let (_guard, notified) = lock.park(guard, expiry).unwrap();
+                    let notified = lock.park(expiry).unwrap();
                     assert_eq!(notified, true, "Expected notified during park");
                     th.join().unwrap();
+                    lock.release().expect("Error unlocking");
                 }
             }
 
@@ -130,11 +109,12 @@ macro_rules! parker_tests {
             fn park_timeout() {
                 let lock = $cls::new();
                 for _ in 0..5 {
-                    let guard = lock.lock().expect("Error locking parker");
+                    lock.acquire().expect("Error locking parker");
                     // no notifier
                     let expiry = Duration::from_millis(50).into_expire();
-                    let (_guard, notified) = lock.park(guard, expiry).unwrap();
+                    let notified = lock.park(expiry).unwrap();
                     assert_eq!(notified, false, "Expected no notification");
+                    lock.release().expect("Error unlocking");
                 }
             }
         }

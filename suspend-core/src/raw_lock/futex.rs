@@ -13,7 +13,7 @@ use core::{
 use libc;
 use std::time::Instant;
 
-use super::{Guard, HasGuard, LockError, RawLock};
+use super::{LockError, RawLock};
 
 const STATE_FREE: i32 = 0b0000;
 const STATE_HELD: i32 = 0b0001;
@@ -51,27 +51,22 @@ impl RawLock for LockImpl {
     }
 
     #[inline]
-    fn lock<'s>(&'s self) -> Result<Guard<'s, Self>, LockError> {
+    fn acquire(&self) -> Result<(), LockError> {
         if self.0.fetch_or(STATE_HELD, Ordering::Acquire) & STATE_HELD == 0 {
-            Ok(Guard::new(GuardImpl(self, true)))
+            Ok(())
         } else {
             Err(LockError::Contended)
         }
     }
 
     #[inline]
-    fn lock_mut<'s>(&'s mut self) -> Guard<'s, Self> {
-        Guard(GuardImpl(self, false))
+    fn release(&self) -> Result<(), LockError> {
+        let found = self.0.fetch_and(!STATE_HELD, Ordering::Release);
+        debug_assert!(found & STATE_HELD != 0);
+        Ok(())
     }
 
-    fn park<'s>(
-        &self,
-        guard: Guard<'s, Self>,
-        timeout: Option<Instant>,
-    ) -> Result<(Guard<'s, Self>, bool), LockError> {
-        if !ptr::eq(self, (guard.0).0) {
-            return Err(LockError::Invalid);
-        }
+    fn park(&self, timeout: Option<Instant>) -> Result<bool, LockError> {
         let futex = &self.0;
 
         // relaxed ordering is suffient, we will check again after acquiring the mutex
@@ -80,7 +75,7 @@ impl RawLock for LockImpl {
             // consume notification
             let found = futex.swap(state & !STATE_NOTIFY, Ordering::Acquire);
             debug_assert_eq!(found, state);
-            return Ok((guard, true));
+            return Ok(true);
         }
 
         let state = match futex.compare_exchange(
@@ -93,7 +88,7 @@ impl RawLock for LockImpl {
             Err(state) if state & STATE_NOTIFY != 0 => {
                 let found = futex.swap(state & !STATE_NOTIFY, Ordering::Acquire);
                 debug_assert_eq!(found, state);
-                return Ok((guard, true));
+                return Ok(true);
             }
             _ => panic!("Invalid lock state update"),
         };
@@ -127,7 +122,7 @@ impl RawLock for LockImpl {
             let state = futex.load(Ordering::Relaxed);
             if timed_out || state & STATE_NOTIFY != 0 {
                 let found = futex.swap(state & !(STATE_PARK | STATE_NOTIFY), Ordering::Acquire);
-                return Ok((guard, found & STATE_NOTIFY != 0));
+                return Ok(found & STATE_NOTIFY != 0);
             }
         }
     }
@@ -161,22 +156,6 @@ impl RawLock for LockImpl {
 impl Debug for LockImpl {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("futex::LockImpl").finish()
-    }
-}
-
-impl<'s> HasGuard<'s> for LockImpl {
-    type Lock = LockImpl;
-    type Guard = GuardImpl<'s>;
-}
-
-#[derive(Debug)]
-pub struct GuardImpl<'s>(&'s LockImpl, bool);
-
-impl<'s> Drop for GuardImpl<'s> {
-    fn drop(&mut self) {
-        if self.1 {
-            (self.0).0.fetch_and(!STATE_HELD, Ordering::Release);
-        }
     }
 }
 
