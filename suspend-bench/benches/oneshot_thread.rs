@@ -7,6 +7,10 @@ use futures_lite::future::block_on;
 use oneshot_rs as oneshot;
 use suspend_channel::send_once;
 
+#[cfg(target = "macos")]
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 fn send_once_telephone(threads: usize) {
     let (sender, mut receiver) = send_once();
     for _ in 0..threads {

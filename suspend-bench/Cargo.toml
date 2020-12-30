@@ -5,12 +5,26 @@ authors = ["Andrew Whitehead <cywolf@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+blocking = "1.0"
 criterion = "0.3"
 futures-channel = "0.3"
 futures-lite = "1.11"
+parking = "2.0"
 oneshot_rs = { package = "oneshot", version = "0.1.2" }
 suspend-channel = { path = "../suspend-channel" }
+suspend-core = { path = "../suspend-core" }
 suspend-exec = { path = "../suspend-exec" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+jemallocator = "0.3"
+
+[[bench]]
+name = "block_on"
+harness = false
+
+[[bench]]
+name = "listener"
+harness = false
 
 [[bench]]
 name = "oneshot_send"
@@ -18,4 +32,8 @@ harness = false
 
 [[bench]]
 name = "oneshot_thread"
+harness = false
+
+[[bench]]
+name = "thread_pool"
 harness = false

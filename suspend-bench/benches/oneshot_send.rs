@@ -5,6 +5,10 @@ use futures_lite::future::block_on;
 use oneshot_rs as oneshot;
 use suspend_channel::send_once;
 
+#[cfg(target = "macos")]
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 fn send_once_many(count: usize) {
     for _ in 0..count {
         let (sender, receiver) = send_once();
