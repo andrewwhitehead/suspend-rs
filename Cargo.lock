@@ -365,19 +365,33 @@ name = "suspend-channel"
 version = "0.1.0"
 dependencies = [
  "futures-core",
- "futures-lite",
  "futures-task",
  "maybe-cell",
+ "suspend-core",
+]
+
+[[package]]
+name = "suspend-core"
+version = "0.1.0"
+dependencies = [
+ "cfg-if 1.0.0",
+ "futures-lite",
+ "libc",
+ "once_cell",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "suspend-exec"
 version = "0.1.0"
 dependencies = [
- "futures-lite",
+ "cfg-if 1.0.0",
+ "libc",
  "num_cpus",
  "once_cell",
  "suspend-channel",
+ "suspend-core",
  "tracing",
  "tracing-subscriber",
 ]

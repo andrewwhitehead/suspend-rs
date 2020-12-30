@@ -1,3 +1,4 @@
 [workspace]
 
-members = ["maybe-cell", "suspend-channel", "suspend-exec"]
+members = ["maybe-cell", "suspend-channel", "suspend-core", "suspend-exec"]
+exclude = ["suspend-bench"]

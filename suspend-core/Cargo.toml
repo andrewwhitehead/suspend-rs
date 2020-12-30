@@ -1,0 +1,31 @@
+[package]
+name = "suspend-core"
+version = "0.1.0"
+authors = ["Andrew Whitehead <cywolf@gmail.com>"]
+edition = "2018"
+description = ""
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/andrewwhitehead/suspend-rs/"
+documentation = "https://docs.rs/suspend-core"
+categories = ["asynchronous", "concurrency", "data-structures"]
+keywords = ["lock", "park", "thread", "waker"]
+
+[lib]
+name = "suspend_core"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+cfg-if = "1.0"
+once_cell = "1.5"
+tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.71"
+
+[dev-dependencies]
+futures-lite = "1.11"
+tracing-subscriber = "0.2"
