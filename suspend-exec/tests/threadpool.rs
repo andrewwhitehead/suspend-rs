@@ -1,141 +1,241 @@
-use std::sync::{
-    atomic::{
-        AtomicBool, AtomicUsize,
-        Ordering::{Relaxed, SeqCst},
-    },
-    Arc, Barrier, Condvar, Mutex,
-};
+use std::future::Future;
+use std::panic;
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::Poll;
 use std::thread;
 use std::time::Duration;
 
-use futures_lite::{
-    future::{block_on, poll_once},
+use suspend_core::{
+    listen::{block_on, block_on_poll},
     pin,
 };
-
 use suspend_exec::{ThreadPool, ThreadPoolConfig};
+
+use self::utils::Track;
+
+mod utils;
+
+fn run_test<T>(test: impl FnOnce() -> T) -> T {
+    tracing_subscriber::fmt::try_init().ok();
+    test()
+}
+
+fn assert_panics_with<T>(msg: &str, test: T) -> ()
+where
+    T: FnOnce() -> thread::Result<()> + panic::UnwindSafe,
+{
+    tracing_subscriber::fmt::try_init().ok();
+    let prev_hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {}));
+    let result = test();
+    panic::set_hook(prev_hook);
+    if let Err(err) = result {
+        if !err
+            .downcast_ref::<String>()
+            .map(|e| &**e)
+            .or_else(|| err.downcast_ref::<&'static str>().map(|e| *e))
+            .map(|e| e.contains(msg))
+            .unwrap_or(false)
+        {
+            panic::resume_unwind(err)
+        }
+    } else {
+        panic!("Expected panic '{}'", msg);
+    }
+}
 
 #[test]
 fn thread_pool_unbounded() {
-    tracing_subscriber::fmt::try_init().ok();
-
-    let pool = Arc::new(ThreadPool::default());
-    let count = 100;
-    let cvar = Arc::new(Condvar::new());
-    let mutex = Mutex::new(());
-    let called = Arc::new(AtomicUsize::new(0));
-    for _ in 0..count {
-        pool.run({
-            let cvar = cvar.clone();
-            let called = called.clone();
-            move || {
-                thread::sleep(Duration::from_millis(5));
-                called.fetch_add(1, SeqCst);
-                cvar.notify_one();
-            }
-        });
-    }
-    let mut guard = mutex.lock().unwrap();
-    loop {
-        if called.load(SeqCst) == count {
-            break;
+    run_test(|| {
+        let pool = ThreadPool::default();
+        let count = 100;
+        let cvar = Arc::new(Condvar::new());
+        let mutex = Mutex::new(());
+        let track = Track::new();
+        for _ in 0..count {
+            // FIXME collect results instead of using mutex/cvar
+            pool.run({
+                let cvar = cvar.clone();
+                let track = track.clone();
+                move || {
+                    thread::sleep(Duration::from_millis(5));
+                    track.call();
+                    drop(track);
+                    cvar.notify_one();
+                }
+            });
         }
-        guard = cvar.wait(guard).unwrap();
-    }
+        let mut guard = mutex.lock().unwrap();
+        loop {
+            if track.call_count() == count {
+                break;
+            }
+            guard = cvar.wait(guard).unwrap();
+        }
+        assert_eq!(track.drop_count(), count);
+    })
 }
 
 #[test]
 fn thread_pool_bounded() {
-    tracing_subscriber::fmt::try_init().ok();
-
-    let pool = Arc::new(ThreadPoolConfig::default().max_count(5).build());
-    let count = 100;
-    let cvar = Arc::new(Condvar::new());
-    let mutex = Mutex::new(());
-    let called = Arc::new(AtomicUsize::new(0));
-    for _ in 0..count {
-        pool.run({
-            let cvar = cvar.clone();
-            let called = called.clone();
-            move || {
-                thread::sleep(Duration::from_millis(5));
-                called.fetch_add(1, SeqCst);
-                cvar.notify_one();
-            }
-        });
-    }
-    let mut guard = mutex.lock().unwrap();
-    loop {
-        if called.load(SeqCst) == count {
-            break;
+    run_test(|| {
+        let pool = ThreadPoolConfig::default().max_count(5).build();
+        let count = 100;
+        let cvar = Arc::new(Condvar::new());
+        let mutex = Mutex::new(());
+        let track = Track::new();
+        for _ in 0..count {
+            pool.run({
+                let cvar = cvar.clone();
+                let track = track.clone();
+                move || {
+                    thread::sleep(Duration::from_millis(5));
+                    track.call();
+                    drop(track);
+                    cvar.notify_one();
+                }
+            });
         }
-        guard = cvar.wait(guard).unwrap();
-    }
+        let mut guard = mutex.lock().unwrap();
+        loop {
+            if track.call_count() == count {
+                break;
+            }
+            guard = cvar.wait(guard).unwrap();
+        }
+        assert_eq!(track.drop_count(), count);
+    })
 }
 
 #[test]
-fn thread_pool_unblock() {
-    tracing_subscriber::fmt::try_init().ok();
+fn thread_pool_panic_run() {
+    assert_panics_with("expected", || {
+        run_test(|| {
+            let pool = ThreadPool::default();
+            pool.run(move || {
+                panic!("expected");
+            })
+            .join()
+        })
+    })
+}
 
-    let pool = Arc::new(ThreadPool::default());
-    assert_eq!(
-        block_on(pool.unblock(|| 99)).expect("Error unwrapping unblock result"),
-        99
-    );
+#[test]
+fn thread_pool_run_async() {
+    run_test(|| {
+        let pool = ThreadPool::default();
+        for i in 0..100 {
+            assert_eq!(
+                block_on(pool.run(move || i)).expect("Error unwrapping run result"),
+                i
+            );
+        }
+    })
 }
 
 #[test]
 fn thread_pool_scoped() {
-    tracing_subscriber::fmt::try_init().ok();
+    run_test(|| {
+        let pool = ThreadPool::default();
+        let (track, _) = Track::new_pair();
+        pool.scoped(|scope| {
+            scope.run(|s| {
+                thread::sleep(Duration::from_millis(50));
+                track.call();
+                s.run(|_| track.call());
+            });
+        });
+        assert_eq!(track.call_count(), 2);
+        assert_eq!(track.drop_count(), 0);
+    })
+}
 
-    let pool = Arc::new(ThreadPool::default());
-    let result = AtomicBool::new(false);
-    pool.scoped(|scope| {
-        scope.run(|| {
-            thread::sleep(Duration::from_millis(50));
-            result.store(true, Relaxed);
+#[test]
+fn thread_pool_panic_scoped() {
+    assert_panics_with("expected", || {
+        run_test(|| {
+            let pool = ThreadPool::default();
+            // all threads joined as scoped() ends
+            pool.scoped(|scope| {
+                scope
+                    .run(|_| {
+                        panic!("expected");
+                    })
+                    .join()
+            })
         })
-    });
-    assert_eq!(result.load(Relaxed), true);
+    })
 }
 
 #[test]
 fn async_scoped_drop() {
-    tracing_subscriber::fmt::try_init().ok();
-
-    // simply check that a never-polled async_scoped future does not block on drop
-    let pool = Arc::new(ThreadPool::default());
-    let fut = pool.async_scoped(|_scope| {});
-    drop(fut);
+    run_test(|| {
+        // check that a never-polled async_scoped future does not block on drop
+        // and that the captured variable is dropped without being used
+        let pool = ThreadPool::default();
+        let (track, effect) = Track::new_pair();
+        let fut = pool.async_scoped(move |_scope| {
+            track.call();
+        });
+        drop(fut);
+        assert_eq!(effect.call_count(), 0);
+        assert_eq!(effect.drop_count(), 1);
+    })
 }
 
 #[test]
 fn async_scoped_poll_and_drop() {
-    tracing_subscriber::fmt::try_init().ok();
-
-    let pool = Arc::new(ThreadPool::default());
-    let barrier = Arc::new(Barrier::new(2));
-    let called = Arc::new(AtomicBool::new(false));
-    let fut = pool.async_scoped(|scope| {
-        let barrier = Arc::clone(&barrier);
-        let called = called.clone();
-        scope.run(move || {
-            barrier.wait();
-            // FIXME - breaks in miri
-            thread::sleep(Duration::from_millis(50));
-            called.store(true, SeqCst);
-        })
-    });
-    // poll once to queue the fn, then drop the future.
-    // this should block until the closure completes
-    {
-        pin!(fut);
-        assert_eq!(block_on(poll_once(&mut fut)), None);
-        // ensure the function is actually executed. otherwise it
-        // could be dropped without being run by the worker thread
-        // (which is acceptable but not what is being tested)
-        barrier.wait();
-        // fut will now be dropped
-    }
-    assert_eq!(called.load(SeqCst), true);
+    run_test(|| {
+        // test that dropping the future after the task is queued
+        // functions as expected
+        let pool = ThreadPool::default();
+        let (track, effect) = Track::new_pair();
+        let fut = pool.async_scoped(|scope| {
+            let track = track.clone();
+            scope.run(move |_| {
+                track.call();
+                // FIXME - breaks in miri without isolation disabled
+                thread::sleep(Duration::from_millis(100));
+                track.call();
+            });
+        });
+        // poll once to queue the fn, then drop the future.
+        // this should block until the closure completes
+        {
+            pin!(fut);
+            let mut fut = Some(fut);
+            assert_eq!(
+                block_on_poll(
+                    move |cx| {
+                        assert!(fut.take().unwrap().poll(cx).is_pending());
+                        Poll::Ready(true)
+                    },
+                    Duration::from_millis(100),
+                ),
+                Poll::Ready(true)
+            );
+            // ensure the function is actually executed. otherwise it
+            // could be dropped without being run by the worker thread
+            // (which is acceptable but not what is being tested)
+            while effect.call_count() == 0 {
+                thread::yield_now();
+            }
+            // thread should still be sleeping
+            assert_eq!(effect.drop_count(), 0);
+            // fut will now be dropped
+        }
+        assert_eq!(effect.call_count(), 2);
+        assert_eq!(effect.drop_count(), 1);
+    })
 }
+
+// #[test]
+// fn test_many() {
+//     run_test(|| loop {
+//         let pool = ThreadPool::default();
+//         for i in 0..10 {
+//             assert_eq!(pool.scoped(|_scope| i), i);
+//         }
+//         tracing::info!(".");
+//     })
+// }
