@@ -672,6 +672,7 @@ dependencies = [
  "futures-channel",
  "futures-lite",
  "jemallocator",
+ "once_cell",
  "oneshot",
  "parking",
  "suspend-channel",
@@ -685,6 +686,7 @@ version = "0.1.0"
 dependencies = [
  "futures-core",
  "maybe-cell",
+ "suspend-core",
 ]
 
 [[package]]
@@ -706,6 +708,7 @@ dependencies = [
  "num_cpus",
  "once_cell",
  "suspend-channel",
+ "suspend-core",
  "tracing",
 ]
 

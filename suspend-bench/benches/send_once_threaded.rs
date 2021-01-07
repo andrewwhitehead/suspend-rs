@@ -3,9 +3,9 @@ use std::thread;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use futures_channel::oneshot as futures_oneshot;
-use futures_lite::future::block_on;
 use oneshot_rs as oneshot;
 use suspend_channel::send_once;
+use suspend_core::listen::block_on;
 
 #[cfg(target = "macos")]
 #[global_allocator]
@@ -17,12 +17,12 @@ fn send_once_telephone(threads: usize) {
         let (next_send, next_receive) = send_once();
         thread::spawn(move || {
             let result = block_on(receiver).unwrap_or(0);
-            next_send.send(result).unwrap();
+            next_send.send_nowait(result).unwrap();
         });
         receiver = next_receive;
     }
     let testval = 1001u32;
-    sender.send(testval).unwrap();
+    sender.send_nowait(testval).unwrap();
     assert_eq!(block_on(receiver), Ok(testval));
 }
 
@@ -59,7 +59,7 @@ fn oneshot_telephone(threads: usize) {
 fn bench_telephone(c: &mut Criterion) {
     let count = 1000;
     c.bench_with_input(
-        BenchmarkId::new("message-telephone", count),
+        BenchmarkId::new("send_once-telephone", count),
         &count,
         |b, &s| {
             b.iter(|| send_once_telephone(s));

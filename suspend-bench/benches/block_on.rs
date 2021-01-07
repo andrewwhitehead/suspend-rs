@@ -84,16 +84,16 @@ fn futures_block_on_repoll() {
 }
 
 fn bench_many(c: &mut Criterion) {
-    c.bench_function(format!("suspend_core block_on_ready").as_str(), move |b| {
+    c.bench_function("suspend_core block_on_ready", move |b| {
         b.iter(|| listen_block_on_ready());
     });
-    c.bench_function(format!("futures_lite block_on_ready").as_str(), move |b| {
+    c.bench_function("futures_lite block_on_ready", move |b| {
         b.iter(|| futures_block_on_ready());
     });
-    c.bench_function(format!("suspend_core block_on_repoll").as_str(), move |b| {
+    c.bench_function("suspend_core block_on_repoll", move |b| {
         b.iter(|| listen_block_on_repoll());
     });
-    c.bench_function(format!("futures_lite block_on_repoll").as_str(), move |b| {
+    c.bench_function("futures_lite block_on_repoll", move |b| {
         b.iter(|| futures_block_on_repoll());
     });
 }

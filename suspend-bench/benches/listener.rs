@@ -16,10 +16,10 @@ fn parking_create() {
 }
 
 fn bench_many(c: &mut Criterion) {
-    c.bench_function(format!("listener create").as_str(), move |b| {
+    c.bench_function("listener create", move |b| {
         b.iter(|| listen_create());
     });
-    c.bench_function(format!("parking create").as_str(), move |b| {
+    c.bench_function("parking create", move |b| {
         b.iter(|| parking_create());
     });
 }
