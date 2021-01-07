@@ -10,7 +10,7 @@ use std::thread;
 use futures_core::FusedFuture;
 use futures_task::{waker_ref, ArcWake};
 
-use suspend_channel::{send_once, Incomplete, StreamNext};
+use suspend_channel::{send_once, RecvError, StreamNext};
 use suspend_core::listen::block_on;
 
 mod utils;
@@ -47,7 +47,7 @@ fn send_once_receive_poll() {
     let mut cx = Context::from_waker(&wr);
     assert_eq!(Pin::new(&mut receiver).poll(&mut cx), Poll::Pending);
     assert_eq!(waker.count(), 0);
-    assert_eq!(sender.send(message), Ok(()));
+    assert_eq!(sender.send_nowait(message), Ok(()));
     assert_eq!(waker.count(), 1);
     assert_eq!(receiver.is_terminated(), false);
     assert_eq!(drops.count(), 0);
@@ -59,7 +59,7 @@ fn send_once_receive_poll() {
         assert_eq!(receiver.is_terminated(), true);
         assert_eq!(
             Pin::new(&mut receiver).poll(&mut cx),
-            Poll::Ready(Err(Incomplete))
+            Poll::Ready(Err(RecvError::Terminated))
         );
         assert_eq!(waker.count(), 1);
         assert_eq!(drops.count(), 1);
@@ -73,23 +73,23 @@ fn send_once_receive_poll() {
 #[test]
 fn send_once_receive_block_on() {
     let (sender, receiver) = send_once();
-    assert_eq!(sender.send(1u32), Ok(()));
+    assert_eq!(sender.send_nowait(1u32), Ok(()));
     assert_eq!(block_on(receiver), Ok(1u32));
 }
 
 #[test]
 fn send_once_receive_wait() {
     let (sender, receiver) = send_once();
-    assert_eq!(sender.send(1u32), Ok(()));
-    assert_eq!(receiver.wait(), Ok(1u32));
+    assert_eq!(sender.send_nowait(1u32), Ok(()));
+    assert_eq!(receiver.recv(), Ok(1u32));
 }
 
 #[test]
 fn send_once_threaded() {
     let (sender0, receiver0) = send_once();
     let (sender1, receiver1) = send_once();
-    thread::spawn(move || sender1.send(block_on(receiver0).unwrap()).unwrap());
-    thread::spawn(move || sender0.send(1u32).unwrap());
+    thread::spawn(move || sender1.send_nowait(block_on(receiver0).unwrap()).unwrap());
+    thread::spawn(move || sender0.send_nowait(1u32).unwrap());
     assert_eq!(block_on(receiver1), Ok(1u32));
 }
 
@@ -101,10 +101,10 @@ fn send_once_sender_dropped() {
     let mut cx = Context::from_waker(&wr);
     assert_eq!(Pin::new(&mut receiver).poll(&mut cx), Poll::Pending);
     drop(sender);
-    assert_eq!(waker.count(), 1);
+    assert_eq!(waker.count(), 1, "Receiver waker not called");
     assert_eq!(
         Pin::new(&mut receiver).poll(&mut cx),
-        Poll::Ready(Err(Incomplete))
+        Poll::Ready(Err(RecvError::Incomplete))
     );
     assert_eq!(waker.count(), 1);
 }
@@ -113,14 +113,14 @@ fn send_once_sender_dropped() {
 fn send_once_receiver_dropped_early() {
     let (sender, receiver) = send_once();
     drop(receiver);
-    assert_eq!(sender.send(1u32), Err(1u32));
+    assert_eq!(sender.send_nowait(1u32), Err(1u32));
 }
 
 #[test]
 fn send_once_receiver_dropped_incomplete() {
     let (sender, receiver) = send_once();
     let (message, drops) = TestDrop::new_pair();
-    sender.send(message).unwrap();
+    sender.send_nowait(message).unwrap();
     assert_eq!(drops.count(), 0);
     //assert!(block_on(receiver).is_ok());
     drop(receiver);
@@ -131,7 +131,7 @@ fn send_once_receiver_dropped_incomplete() {
 fn send_once_receiver_dropped_complete() {
     let (sender, receiver) = send_once();
     let (message, drops) = TestDrop::new_pair();
-    sender.send(message).unwrap();
+    sender.send_nowait(message).unwrap();
     let result = block_on(receiver).unwrap();
     assert_eq!(drops.count(), 0);
     drop(result);
@@ -141,7 +141,7 @@ fn send_once_receiver_dropped_complete() {
 #[test]
 fn send_once_receiver_stream_one() {
     let (sender, mut receiver) = send_once::<u32>();
-    sender.send(5).unwrap();
+    sender.send_nowait(5).unwrap();
     assert_eq!(receiver.is_terminated(), false);
     assert_eq!(block_on(receiver.next()), Some(5));
     assert_eq!(receiver.is_terminated(), true);
@@ -162,66 +162,66 @@ fn send_once_receiver_stream_empty() {
 fn send_once_receiver_cancel_early() {
     let (sender, receiver) = send_once::<u32>();
     assert_eq!(receiver.cancel(), None);
-    assert!(sender.send(5).is_err());
+    assert!(sender.send_nowait(5).is_err());
 }
 
 #[test]
 fn send_once_receiver_cancel_late() {
     let (sender, receiver) = send_once::<u32>();
-    sender.send(5).unwrap();
+    sender.send_nowait(5).unwrap();
     assert_eq!(receiver.cancel(), Some(5));
 }
 
 #[test]
-fn send_once_tracked() {
+fn send_once_flush() {
     let (sender, receiver) = send_once();
     let (message, drops) = TestDrop::new_pair();
     let waker = Arc::new(TestWaker::new());
     let wr = waker_ref(&waker);
     let mut cx = Context::from_waker(&wr);
-    let mut track_send = sender.track_send(message);
-    assert_eq!(track_send.is_terminated(), false);
-    assert_eq!(Pin::new(&mut track_send).poll(&mut cx), Poll::Pending);
-    assert_eq!(track_send.is_terminated(), false);
+    let mut flush = sender.send(message);
+    assert_eq!(flush.is_terminated(), false);
+    assert_eq!(Pin::new(&mut flush).poll(&mut cx), Poll::Pending);
+    assert_eq!(flush.is_terminated(), false);
     assert_eq!(waker.count(), 0);
     assert_eq!(drops.count(), 0);
 
     let result = block_on(receiver).unwrap();
     assert_eq!(drops.count(), 0);
     assert_eq!(waker.count(), 1);
-    assert_eq!(track_send.is_terminated(), false);
-    assert_eq!(Pin::new(&mut track_send).poll(&mut cx), Poll::Ready(Ok(())));
-    assert_eq!(track_send.is_terminated(), true);
-    drop(track_send);
+    assert_eq!(flush.is_terminated(), false);
+    assert_eq!(Pin::new(&mut flush).poll(&mut cx), Poll::Ready(Ok(())));
+    assert_eq!(flush.is_terminated(), true);
+    drop(flush);
     assert_eq!(drops.count(), 0);
     drop(result);
     assert_eq!(drops.count(), 1);
 }
 
 #[test]
-fn send_once_tracked_drop() {
+fn send_once_flush_drop() {
     let (sender, receiver) = send_once();
     let (message, drops) = TestDrop::new_pair();
     let waker = Arc::new(TestWaker::new());
     let wr = waker_ref(&waker);
     let mut cx = Context::from_waker(&wr);
-    let mut track_send = sender.track_send(message);
-    assert_eq!(track_send.is_terminated(), false);
-    assert_eq!(Pin::new(&mut track_send).poll(&mut cx), Poll::Pending);
-    assert_eq!(track_send.is_terminated(), false);
+    let mut flush = sender.send(message);
+    assert_eq!(flush.is_terminated(), false);
+    assert_eq!(Pin::new(&mut flush).poll(&mut cx), Poll::Pending);
+    assert_eq!(flush.is_terminated(), false);
     assert_eq!(waker.count(), 0);
     assert_eq!(drops.count(), 0);
 
     drop(receiver);
     assert_eq!(drops.count(), 0);
     assert_eq!(waker.count(), 1);
-    assert_eq!(track_send.is_terminated(), false);
+    assert_eq!(flush.is_terminated(), false);
     assert_eq!(
-        Pin::new(&mut track_send).poll(&mut cx).map_err(|_| ()),
+        Pin::new(&mut flush).poll(&mut cx).map_err(|_| ()),
         Poll::Ready(Err(()))
     );
     assert_eq!(drops.count(), 1);
-    assert_eq!(track_send.is_terminated(), true);
-    drop(track_send);
+    assert_eq!(flush.is_terminated(), true);
+    drop(flush);
     assert_eq!(drops.count(), 1);
 }

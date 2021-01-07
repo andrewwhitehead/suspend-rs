@@ -4,7 +4,7 @@ use core::{
     marker::PhantomData,
     mem::ManuallyDrop,
     pin::Pin,
-    sync::atomic::{fence, spin_loop_hint, AtomicU8, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
     task::{Context, Poll, Waker},
 };
 use std::panic;
@@ -13,16 +13,15 @@ use std::time::Instant;
 use futures_core::{FusedFuture, FusedStream, Stream};
 use suspend_core::{listen::block_on_poll, util::BoxPtr, Expiry};
 
-use super::error::{Incomplete, TimedOut};
-use super::util::{Maybe, MaybeCopy};
+use super::error::RecvError;
+use super::util::Maybe;
 
 const STATE_DONE: u8 = 0b0000;
-const STATE_INIT: u8 = 0b0001;
-const STATE_LOCKED: u8 = 0b0010;
+const STATE_ACTIVE: u8 = 0b0001;
 const STATE_LOADED: u8 = 0b0100;
+const STATE_WLOCK: u8 = 0b10000;
+const STATE_RLOCK: u8 = 0b100000;
 const STATE_WAKE: u8 = 0b1000;
-const WAKE_RECV: u8 = STATE_WAKE;
-const WAKE_SEND: u8 = STATE_WAKE | STATE_LOADED;
 
 /// Create a channel for sending a single value between a producer and consumer.
 pub fn send_once<T>() -> (SendOnce<T>, ReceiveOnce<T>) {
@@ -58,7 +57,7 @@ pub(crate) struct Channel<T> {
 impl<T> Channel<T> {
     pub const fn new() -> Self {
         Self {
-            state: AtomicU8::new(STATE_INIT),
+            state: AtomicU8::new(STATE_ACTIVE),
             value: Maybe::empty(),
             waker: Maybe::empty(),
         }
@@ -66,296 +65,274 @@ impl<T> Channel<T> {
 
     #[inline]
     fn is_done(&self) -> bool {
-        self.state.load(Ordering::Relaxed) == STATE_DONE
+        self.state.load(Ordering::Relaxed) & (STATE_ACTIVE | STATE_LOADED) == 0
     }
 
-    /// Try to receive a value, optionally registering a waker.
-    /// Ready value is (stored value, dropped flag).
-    pub fn poll_recv(&self, cx: Option<&mut Context<'_>>) -> Poll<(Option<T>, bool)> {
-        let mut locked = false;
-        let mut state = self.state.load(Ordering::Relaxed);
-        let cx = loop {
-            match state {
-                STATE_INIT => {
-                    if let Some(cx) = cx {
-                        break cx;
-                    } else {
-                        return Poll::Pending;
-                    }
-                }
-                STATE_DONE => {
-                    // sender dropped without storing a value
-                    fence(Ordering::Acquire);
-                    return Poll::Ready((None, true));
-                }
-                STATE_LOADED => {
-                    // sender dropped after storing a value
-                    fence(Ordering::Acquire);
-                    let value = unsafe { self.value.load() };
-                    self.state.store(STATE_DONE, Ordering::Relaxed);
-                    return Poll::Ready((Some(value), true));
-                }
-                WAKE_RECV => {
-                    if let Some(cx) = cx {
-                        unsafe { self.waker.clear() };
-                        break cx;
-                    } else {
-                        return Poll::Pending;
-                    }
-                }
-                WAKE_SEND => {
-                    // sender stored a value and a waker
-                    if !locked {
-                        // need to lock the state now to avoid conflict if the sender is dropped
-                        state = self.wait_for_lock();
-                        locked = true;
-                        continue;
-                    }
-                    let value = Some(unsafe { self.value.load() });
-                    let send_waker = unsafe { self.waker.load() };
-                    if self.state.swap(STATE_INIT, Ordering::Release) == STATE_DONE {
-                        // sender dropped
-                        drop(send_waker);
-                        return Poll::Ready((value, true));
-                    }
-                    send_waker.wake();
-                    return Poll::Ready((value, false));
-                }
-                s => panic!("Invalid channel state {}", s),
-            }
-        };
-
-        unsafe { self.waker.store(cx.waker().clone()) };
-        if self.state.swap(WAKE_RECV, Ordering::Release) == STATE_DONE {
-            // sender dropped
-            unsafe { self.waker.clear() };
-            return Poll::Ready((None, true));
+    pub fn write(&self, value: T, mut waker: Option<&Waker>, finalize: bool) -> Result<(), T> {
+        let state = self.state.load(Ordering::Relaxed);
+        if state & STATE_ACTIVE == 0 {
+            // synchronize with the reader's drop
+            self.state.load(Ordering::Acquire);
+            return Err(value);
         }
-        Poll::Pending
-    }
-
-    /// Returns (stored value, dropped flag).
-    pub fn cancel_recv(&self) -> (Option<T>, bool) {
-        match self.state.fetch_and(STATE_LOADED, Ordering::Release) {
-            prev if prev & STATE_LOCKED != 0 => {
-                // sender was holding the lock, will handle drop
-                (None, false)
-            }
-            STATE_INIT => {
-                // sender still active
-                (None, false)
-            }
-            STATE_DONE => {
-                // sender dropped
-                (None, true)
-            }
-            STATE_LOADED => {
-                // sender loaded a value and dropped
-                (Some(unsafe { self.value.load() }), true)
-            }
-            WAKE_SEND => {
-                // sender loaded a value, waiting for receiver
-                // the state is now STATE_LOADED
-                unsafe { self.waker.load() }.wake();
-                (None, false)
-            }
-            WAKE_RECV => {
-                // drop previous waker
-                unsafe { self.waker.clear() };
-                (None, false)
-            }
-            _ => panic!("Invalid channel state"),
+        if state & STATE_LOADED != 0 {
+            panic!("Invalid send to loaded channel");
         }
-    }
-
-    // Returns (stored value, dropped flag).
-    pub fn cancel_recv_poll(&self) -> (Option<T>, bool) {
-        match self.wait_for_lock() {
-            prev if prev & STATE_LOCKED != 0 => {
-                // sender was holding the lock, will handle drop
-                (None, false)
-            }
-            STATE_DONE => {
-                // sender dropped
-                (None, true)
-            }
-            STATE_LOADED => {
-                // sender loaded a value and dropped
-                (Some(unsafe { self.value.load() }), true)
-            }
-            WAKE_SEND => {
-                // sender loaded a value, waiting for receiver
-                let value = Some(unsafe { self.value.load() });
-                let send_waker = unsafe { self.waker.load() };
-                self.state.store(STATE_INIT, Ordering::Release);
-                send_waker.wake();
-                (value, false)
-            }
-            WAKE_RECV => {
-                // drop previous waker
-                unsafe { self.waker.clear() };
-                self.state.store(STATE_INIT, Ordering::Release);
-                (None, false)
-            }
-            _ => panic!("Invalid channel state"),
-        }
-    }
-
-    /// Error value is (unstored value, dropped flag).
-    pub fn send(&self, value: T, cx: Option<&mut Context<'_>>) -> Result<(), (T, bool)> {
-        let recv_waker = match self.wait_for_lock() {
-            STATE_INIT => {
-                // receiver is waiting
-                None
-            }
-            STATE_DONE => {
-                // receiver dropped
-                self.state.store(STATE_DONE, Ordering::Relaxed);
-                return Err((value, true));
-            }
-            WAKE_RECV => {
-                // receiver stored a waker
-                Some(unsafe { self.waker.load() })
-            }
-            _ => panic!("Invalid channel state"),
-        };
-
         unsafe { self.value.store(value) };
-        let state = if let Some(cx) = cx {
-            unsafe { self.waker.store(cx.waker().clone()) };
-            WAKE_SEND
-        } else {
-            STATE_LOADED
-        };
-        if self.state.swap(state, Ordering::Release) == STATE_DONE {
-            // receiver dropped
-            drop(recv_waker);
-            if state == WAKE_SEND {
-                unsafe { self.waker.clear() };
+        // release - sync update to the store, above. acquire - sync update to the waker, below.
+        let mut prev = self
+            .state
+            .fetch_or(STATE_LOADED | STATE_WLOCK | STATE_WAKE, Ordering::AcqRel);
+        if prev & STATE_WLOCK == 0 {
+            let recv_waker = if prev & STATE_WAKE != 0 {
+                Some(unsafe { self.waker.load() })
+            } else {
+                None
+            };
+            if let Some(waker) = waker.take() {
+                unsafe { self.waker.store(waker.clone()) };
+                prev = self.state.fetch_and(!STATE_WLOCK, Ordering::Release);
+                if prev & STATE_ACTIVE == 0 {
+                    // drop the waker we just stored
+                    unsafe { self.waker.clear() };
+                    return Err(unsafe { self.value.load() });
+                }
+            } else {
+                let mut remove = STATE_WLOCK | STATE_WAKE;
+                if finalize {
+                    remove |= STATE_ACTIVE;
+                }
+                prev = self.state.fetch_and(!remove, Ordering::Release);
+                if prev & STATE_ACTIVE == 0 {
+                    return Err(unsafe { self.value.load() });
+                }
             }
-            return Err((unsafe { self.value.load() }, true));
+            recv_waker.map(Waker::wake);
+        } else {
+            // receiver locked the waker. it will see STATE_LOADED when it unlocks
+            // and take the value immediately. call our waker to proceed to flush()
+            if let Some(waker) = waker {
+                waker.wake_by_ref();
+            }
+            // note: receiver will also reset the WAKE flag appropriately
         }
-        recv_waker.map(Waker::wake);
         Ok(())
     }
 
-    fn poll_send(&self, cx: &mut Context<'_>) -> Poll<(Option<T>, bool)> {
-        match self.wait_for_lock() {
-            STATE_DONE => {
-                // receiver completed and dropped
+    pub fn flush(&self, waker: &Waker, finalize: bool) -> Poll<(Option<T>, bool)> {
+        let mut prev = self.state.load(Ordering::Relaxed);
+        let mut locked = false;
+        loop {
+            if prev & STATE_LOADED == 0 {
+                if locked {
+                    // reset state
+                    let mut remove = STATE_WLOCK | STATE_WAKE;
+                    if finalize {
+                        remove |= STATE_ACTIVE;
+                    }
+                    self.state.fetch_and(!remove, Ordering::Relaxed);
+                } else {
+                    // using acquire to sync with the read
+                    prev = if finalize {
+                        self.state.fetch_and(!STATE_ACTIVE, Ordering::Acquire)
+                    } else {
+                        self.state.load(Ordering::Acquire)
+                    };
+                }
+                return Poll::Ready((None, prev & STATE_ACTIVE == 0));
+            }
+            if prev & STATE_ACTIVE == 0 {
+                // receiver dropped, leaving value. there must not be a waker
+                if !finalize {
+                    // clear LOADED flag for when the writer drops
+                    self.state.store(STATE_DONE, Ordering::Relaxed);
+                }
+                return Poll::Ready((Some(unsafe { self.value.load() }), true));
+            }
+            if prev & STATE_RLOCK != 0 {
+                // read in progress, just call waker
+                // reader would have also set WLOCK and WAKE, so leave them alone
+                waker.wake_by_ref();
+                return Poll::Pending;
+            }
+            if locked {
+                if prev & STATE_WAKE != 0 {
+                    // take previous send waker
+                    unsafe { self.waker.clear() };
+                }
+                unsafe { self.waker.store(waker.clone()) };
+                return Poll::Pending;
+            } else {
+                prev = match self.state.compare_exchange(
+                    prev,
+                    prev | STATE_WLOCK | STATE_WAKE,
+                    Ordering::Acquire,
+                    Ordering::Acquire,
+                ) {
+                    Ok(s) => {
+                        locked = true;
+                        s
+                    }
+                    Err(s) if s & STATE_WLOCK != 0 => {
+                        // read in progress, just call waker
+                        waker.wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    Err(s) => {
+                        // read completed or reader dropped, retry
+                        s
+                    }
+                };
+            }
+        }
+    }
+
+    pub fn read(&self, mut waker: Option<&Waker>, or_cancel: bool) -> Poll<(Option<T>, bool)> {
+        let mut prev = self
+            .state
+            .fetch_or(STATE_RLOCK | STATE_WLOCK | STATE_WAKE, Ordering::Acquire);
+        let (locked, prev_wake) = (prev & STATE_WLOCK == 0, prev & STATE_WAKE != 0);
+        if prev & STATE_LOADED != 0 {
+            let value = unsafe { self.value.load() };
+            let send_waker = if locked && prev_wake {
+                Some(unsafe { self.waker.load() })
+            } else {
+                None
+            };
+            if locked {
+                prev = self.state.fetch_and(
+                    // if finalize { STATE_DONE } else { STATE_ACTIVE },
+                    !(STATE_LOADED | STATE_WLOCK | STATE_WAKE | STATE_RLOCK),
+                    Ordering::Release,
+                );
+            } else {
+                // leave WLOCK and WAKE for the sender to control
+                prev = self
+                    .state
+                    .fetch_and(!(STATE_RLOCK | STATE_LOADED), Ordering::Release);
+            }
+            send_waker.map(Waker::wake);
+            Poll::Ready((Some(value), prev & STATE_ACTIVE == 0))
+        } else {
+            // a value was loaded
+
+            // WLOCK without LOADED should only be set by read()
+            assert_eq!(locked, true, "Should not be locked");
+
+            if prev_wake {
+                // drop previous receive waker
+                unsafe { self.waker.clear() };
+            }
+            if prev & STATE_ACTIVE != 0 {
+                if let Some(waker) = waker.take() {
+                    unsafe { self.waker.store(waker.clone()) };
+                    prev = self
+                        .state
+                        .fetch_and(!(STATE_RLOCK | STATE_WLOCK), Ordering::Release);
+                    if prev & STATE_ACTIVE == 0 {
+                        // drop waker we just stored
+                        unsafe { self.waker.clear() };
+                    }
+                } else {
+                    let mut remove = STATE_RLOCK | STATE_WLOCK | STATE_WAKE;
+                    if or_cancel {
+                        remove |= STATE_ACTIVE;
+                    }
+                    prev = self.state.fetch_and(!remove, Ordering::Release);
+                }
+            }
+            if prev & STATE_LOADED != 0 {
+                // sender loaded a value while we were locked - retry
+                self.read(None, or_cancel)
+            } else if prev & STATE_ACTIVE == 0 {
+                // sender dropped
                 Poll::Ready((None, true))
-            }
-            prev @ STATE_INIT | prev @ WAKE_RECV => {
-                // receiver completed and reset
-                self.state.store(prev, Ordering::Release);
-                Poll::Ready((None, false))
-            }
-            STATE_LOADED => {
-                // receiver dropped and left the result
-                Poll::Ready((Some(unsafe { self.value.load() }), true))
-            }
-            WAKE_SEND => {
-                // still waiting for receiver
-                unsafe { self.waker.replace(cx.waker().clone()) };
-                self.state.store(WAKE_SEND, Ordering::Release);
+            } else {
                 Poll::Pending
             }
-            _ => panic!("Invalid channel state"),
         }
     }
 
-    /// Returns dropped flag.
-    pub fn cancel_send(&self) -> bool {
-        match self.state.swap(STATE_DONE, Ordering::Release) {
-            prev if prev & STATE_LOCKED != 0 => {
-                // receiver has the lock, will handle drop
-                false
+    pub fn drop_one_side(&self, is_writer: bool) -> bool {
+        let mut prev = self
+            .state
+            .fetch_or(STATE_WLOCK | STATE_WAKE, Ordering::Acquire);
+        if prev & STATE_ACTIVE == 0 {
+            // reader already dropped
+            if prev & STATE_LOADED != 0 {
+                unsafe { self.value.clear() };
             }
-            STATE_INIT => {
-                // receiver still active
-                false
-            }
-            STATE_DONE => {
-                // receiver already dropped
-                true
-            }
-            WAKE_RECV => {
-                // receiver loaded a waker
-                unsafe { self.waker.load() }.wake();
-                false
-            }
-            _ => panic!("Invalid channel state"),
-        }
-    }
-
-    fn cancel_send_poll(&self) -> bool {
-        match self.state.fetch_or(STATE_LOCKED, Ordering::AcqRel) {
-            prev if prev & STATE_LOCKED != 0 => {
-                // lock held by receiver
-                false
-            }
-            STATE_INIT => {
-                // receiver completed and reset
-                self.state.store(STATE_DONE, Ordering::Release);
-                false
-            }
-            STATE_DONE => {
-                // receiver completed and dropped
-                true
-            }
-            WAKE_SEND => {
-                // still waiting for receiver
+            if prev & STATE_WAKE != 0 {
                 unsafe { self.waker.clear() };
-                self.state.store(STATE_LOADED, Ordering::Release);
+            }
+            true
+        } else {
+            if prev & STATE_WLOCK == 0 {
+                let waker = if prev & STATE_WAKE != 0 {
+                    if (prev & STATE_LOADED != 0) ^ is_writer {
+                        // call waker, it's not ours
+                        Some(unsafe { self.waker.load() })
+                    } else {
+                        // clear waker, it's ours
+                        unsafe { self.waker.clear() };
+                        None
+                    }
+                } else {
+                    None
+                };
+                prev = self.state.fetch_and(
+                    !(STATE_WLOCK | STATE_WAKE | STATE_ACTIVE),
+                    Ordering::Release,
+                );
+                waker.map(Waker::wake);
+            } else {
+                prev = self.state.fetch_and(!STATE_ACTIVE, Ordering::Release);
+            }
+            if prev & STATE_ACTIVE == 0 {
+                // other side beat us to the drop
+                unsafe { self.value.clear() };
+                true
+            } else {
                 false
             }
-            _ => panic!("Invalid channel state"),
         }
     }
 
-    pub fn wait_recv(&self) -> (Option<T>, bool) {
-        if let Poll::Ready(result) = self.wait_recv_poll(None) {
+    pub fn wait_read(&self) -> (Option<T>, bool) {
+        // poll once without creating a listener in case the value is ready
+        if let Poll::Ready(result) = self.read(None, false) {
+            result
+        }
+        // poll with a listener
+        else if let Poll::Ready(result) = self.block_on_read(None) {
             result
         } else {
             unreachable!()
         }
     }
 
-    pub fn wait_recv_timeout(&self, timeout: Option<Instant>) -> (Option<T>, bool) {
-        match self.wait_recv_poll(timeout) {
+    pub fn wait_read_timeout(&self, timeout: Option<Instant>) -> (Option<T>, bool) {
+        // poll once without creating a listener in case the value is ready
+        if let Poll::Ready(result) = self.read(None, false) {
+            return result;
+        }
+        // poll with a listener
+        match self.block_on_read(timeout) {
             Poll::Ready(result) => result,
-            Poll::Pending => self.cancel_recv_poll(),
-        }
-    }
-
-    #[inline]
-    fn wait_for_lock(&self) -> u8 {
-        loop {
-            let prev = self.state.fetch_or(STATE_LOCKED, Ordering::Relaxed);
-            if prev & STATE_LOCKED == 0 {
-                fence(Ordering::Acquire);
-                return prev;
-            }
-            spin_loop_hint();
-        }
-    }
-
-    #[inline]
-    fn wait_recv_poll(&self, timeout: impl Expiry) -> Poll<(Option<T>, bool)> {
-        let mut first = true;
-        let timeout: Option<Instant> = timeout.into_expire();
-        block_on_poll(
-            |cx| {
-                if first {
-                    first = false;
-                    self.poll_recv(Some(cx))
+            Poll::Pending => {
+                // cancel read - return value if any was stored
+                if let Poll::Ready(r) = self.read(None, true) {
+                    r
                 } else {
-                    // no need to update the waker after the first poll
-                    self.poll_recv(None)
+                    (None, false)
                 }
-            },
-            timeout,
-        )
+            }
+        }
+    }
+
+    #[inline]
+    fn block_on_read(&self, timeout: Option<Instant>) -> Poll<(Option<T>, bool)> {
+        block_on_poll(|cx| self.read(Some(cx.waker()), false), timeout)
     }
 }
 
@@ -369,62 +346,68 @@ impl<T> Debug for Channel<T> {
 
 impl<T> panic::RefUnwindSafe for Channel<T> {}
 
-/// A [`Future`] which resolves once a send has completed.
+/// A [`Future`] which resolves once a write has completed.
+#[must_use = "Flush does nothing unless you `.await` or poll it"]
 #[derive(Debug)]
-pub struct TrackSend<'a, T> {
-    channel: MaybeCopy<Option<BoxPtr<Channel<T>>>>,
-    value: Maybe<Option<T>>,
-    drops: bool,
+pub struct Flush<'a, T> {
+    channel: Option<BoxPtr<Channel<T>>>,
+    value: Option<T>,
+    finalize: bool,
     _marker: PhantomData<&'a mut T>,
 }
 
-impl<T> Drop for TrackSend<'_, T> {
+impl<T> Drop for Flush<'_, T> {
     fn drop(&mut self) {
-        unsafe {
-            let channel = self.channel.load();
-            channel.map(|c| c.cancel_send_poll());
-            self.value.clear();
+        if let Some(channel) = self.channel.take() {
+            if self.finalize {
+                if channel.drop_one_side(true) {
+                    drop(unsafe { channel.into_box() });
+                }
+            }
+            // else: try to take the value out of the channel? otherwise
+            // it can panic on the next send.
         }
     }
 }
 
-impl<T> Future for TrackSend<'_, T> {
+impl<T> Future for Flush<'_, T> {
     type Output = Result<(), T>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(value) = unsafe { self.value.replace(None) } {
-            if let Some(channel) = unsafe { self.channel.load() } {
-                if let Err((value, dropped)) = channel.send(value, Some(cx)) {
-                    if dropped && self.drops {
-                        drop(unsafe { channel.into_box() });
-                    }
-                    unsafe { self.channel.store(None) };
-                    Poll::Ready(Err(value))
-                } else {
-                    Poll::Pending
-                }
-            } else {
-                Poll::Ready(Err(value))
-            }
-        } else if let Some(channel) = unsafe { self.channel.load() } {
-            channel.poll_send(cx).map(|(result, dropped)| {
-                if dropped && self.drops {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(value) = self.value.take() {
+            let channel = self.channel.take().unwrap();
+            if let Err(value) = channel.write(value, Some(cx.waker()), self.finalize) {
+                if self.finalize {
                     drop(unsafe { channel.into_box() });
                 }
-                unsafe { self.channel.store(None) };
-                result.map(Err).unwrap_or(Ok(()))
-            })
+                Poll::Ready(Err(value))
+            } else {
+                self.channel.replace(channel);
+                Poll::Pending
+            }
+        } else if let Some(channel) = self.channel.take() {
+            if let Poll::Ready((result, dropped)) = channel.flush(cx.waker(), self.finalize) {
+                if dropped && self.finalize {
+                    drop(unsafe { channel.into_box() });
+                }
+                Poll::Ready(result.map(Err).unwrap_or(Ok(())))
+            } else {
+                self.channel.replace(channel);
+                Poll::Pending
+            }
         } else {
             Poll::Ready(Ok(()))
         }
     }
 }
 
-impl<T> FusedFuture for TrackSend<'_, T> {
+impl<T> FusedFuture for Flush<'_, T> {
     fn is_terminated(&self) -> bool {
-        unsafe { self.channel.as_ref() }.is_none()
+        self.channel.is_none()
     }
 }
+
+impl<T> Unpin for Flush<'_, T> {}
 
 /// Created by [`send_once()`] and used to dispatch a single value
 /// to an associated [`ReceiveOnce`] instance.
@@ -440,24 +423,21 @@ impl<T> SendOnce<T> {
     }
 
     /// Dispatch the result and consume the [`SendOnce`].
-    pub fn send(self, value: T) -> Result<(), T> {
+    pub fn send_nowait(self, value: T) -> Result<(), T> {
         let channel = ManuallyDrop::new(self).channel;
-        channel.send(value, None).map_err(|(value, drop_channel)| {
-            if drop_channel {
-                drop(unsafe { channel.into_box() });
-            }
+        channel.write(value, None, true).map_err(|value| {
+            drop(unsafe { channel.into_box() });
             value
         })
     }
 
     /// Load a value to be sent, returning a [`Future`] which resolves when
     /// the value is received or the [`ReceiveOnce`] is dropped.
-    pub fn track_send(self, value: T) -> TrackSend<'static, T> {
-        let channel = ManuallyDrop::new(self).channel;
-        TrackSend {
-            channel: Some(channel).into(),
-            value: Some(value).into(),
-            drops: true,
+    pub fn send(self, value: T) -> Flush<'static, T> {
+        Flush {
+            channel: Some(ManuallyDrop::new(self).channel),
+            value: Some(value),
+            finalize: true,
             _marker: PhantomData,
         }
     }
@@ -465,121 +445,137 @@ impl<T> SendOnce<T> {
 
 impl<T> Drop for SendOnce<T> {
     fn drop(&mut self) {
-        if self.channel.cancel_send() {
+        if self.channel.drop_one_side(true) {
             drop(unsafe { self.channel.into_box() });
         }
     }
 }
 
+impl<T> Unpin for SendOnce<T> {}
+
 /// Created by [`send_once()`] and used to receive a single value from
 /// an associated [`SendOnce`] instance.
 #[derive(Debug)]
 pub struct ReceiveOnce<T> {
-    channel: MaybeCopy<BoxPtr<Channel<T>>>,
+    channel: Option<BoxPtr<Channel<T>>>,
 }
 
 impl<T> ReceiveOnce<T> {
     /// Safely cancel the receive operation, consuming the [`ReceiveOnce`].
     pub fn cancel(self) -> Option<T> {
-        let channel = unsafe { ManuallyDrop::new(self).channel.load() };
-        let (result, dropped) = channel.cancel_recv();
-        if dropped {
-            drop(unsafe { channel.into_box() });
-        }
-        result
+        ManuallyDrop::new(self).channel.take().and_then(|channel| {
+            if let Poll::Ready((result, dropped)) = channel.read(None, true) {
+                if dropped {
+                    drop(unsafe { channel.into_box() });
+                }
+                result
+            } else {
+                // sender has not dropped or produced a value
+                None
+            }
+        })
     }
 
     /// Try to receive the value, consuming the [`ReceiveOnce`] if the value
     /// has been loaded or the [`SendOnce`] has been dropped.
-    pub fn try_recv(self) -> Result<Result<T, Incomplete>, Self> {
-        let channel = unsafe { self.channel.load() };
-        match channel.poll_recv(None) {
-            Poll::Ready((result, dropped)) => {
-                let _ = ManuallyDrop::new(self);
-                if dropped {
-                    drop(unsafe { channel.into_box() });
-                }
-                Ok(result.ok_or(Incomplete))
-            }
-            Poll::Pending => {
-                unsafe { self.channel.store(channel) };
-                Err(self)
-            }
+    #[inline]
+    pub fn try_recv(&mut self) -> Option<Result<T, RecvError>> {
+        match self.poll_result(None) {
+            Poll::Ready(r) => Some(r),
+            Poll::Pending => None,
         }
     }
 
     /// Block the current thread until a value is received or the [`SendOnce`] is dropped.
-    pub fn recv(self) -> Result<T, Incomplete> {
-        let channel = unsafe { ManuallyDrop::new(self).channel.load() };
-        let (result, dropped) = channel.wait_recv();
-        if dropped {
-            drop(unsafe { channel.into_box() });
+    pub fn recv(self) -> Result<T, RecvError> {
+        if let Some(channel) = ManuallyDrop::new(self).channel.take() {
+            let (result, dropped) = channel.wait_read();
+            if dropped {
+                drop(unsafe { channel.into_box() });
+            }
+            result.ok_or(RecvError::Incomplete)
+        } else {
+            Err(RecvError::Terminated)
         }
-        result.ok_or(Incomplete)
     }
 
     /// Block the current thread until a value is received or the [`SendOnce`] is dropped,
     /// returning `Err(Self)` if a timeout is reached.
-    pub fn recv_timeout(self, timeout: impl Expiry) -> Result<Result<T, Incomplete>, Self> {
-        let channel = unsafe { self.channel.load() };
-        match channel.wait_recv_timeout(timeout.into_expire()) {
-            (Some(result), true) => {
-                let _ = ManuallyDrop::new(self);
+    pub fn recv_timeout(&mut self, timeout: impl Expiry) -> Result<T, RecvError> {
+        if let Some(channel) = self.channel.take() {
+            let (result, dropped) = channel.wait_read_timeout(timeout.into_opt_instant());
+            if dropped {
                 drop(unsafe { channel.into_box() });
-                Ok(Ok(result))
+                result.ok_or(RecvError::Incomplete)
+            } else if let Some(result) = result {
+                Ok(result)
+            } else {
+                self.channel.replace(channel);
+                Err(RecvError::TimedOut)
             }
-            (None, true) => {
-                let _ = ManuallyDrop::new(self);
-                drop(unsafe { channel.into_box() });
-                Ok(Err(Incomplete))
+        } else {
+            Err(RecvError::Terminated)
+        }
+    }
+
+    // poll for the result (internal)
+    fn poll_result(&mut self, waker: Option<&Waker>) -> Poll<Result<T, RecvError>> {
+        if let Some(channel) = self.channel {
+            if let Poll::Ready((result, dropped)) = channel.read(waker, false) {
+                if dropped {
+                    self.channel.take();
+                    drop(unsafe { channel.into_box() });
+                }
+                Poll::Ready(result.ok_or(RecvError::Incomplete))
+            } else {
+                // sender has not dropped or produced a value
+                Poll::Pending
             }
-            (Some(result), false) => {
-                let _ = ManuallyDrop::new(self);
-                Ok(Ok(result))
-            }
-            (None, false) => Err(self),
+        } else {
+            Poll::Ready(Err(RecvError::Terminated))
         }
     }
 }
 
 impl<T> Drop for ReceiveOnce<T> {
     fn drop(&mut self) {
-        let channel = unsafe { self.channel.load() };
-        if let (_, true) = channel.cancel_recv() {
-            drop(unsafe { channel.into_box() });
+        if let Some(channel) = self.channel.take() {
+            if channel.drop_one_side(false) {
+                drop(unsafe { channel.into_box() });
+            }
         }
     }
 }
 
 impl<T> Future for ReceiveOnce<T> {
-    type Output = Result<T, Incomplete>;
+    type Output = Result<T, RecvError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let channel = unsafe { self.channel.load() };
-        channel.poll_recv(Some(cx)).map(|r| r.0.ok_or(Incomplete))
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.poll_result(Some(cx.waker()))
     }
 }
 
 impl<T> FusedFuture for ReceiveOnce<T> {
     fn is_terminated(&self) -> bool {
-        unsafe { self.channel.as_ref() }.is_done()
+        self.channel.as_ref().map(|c| c.is_done()).unwrap_or(true)
     }
 }
 
 impl<T> Stream for ReceiveOnce<T> {
     type Item = T;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let channel = unsafe { self.channel.load() };
-        channel.poll_recv(Some(cx)).map(|r| r.0)
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.poll_result(Some(cx.waker())).map(Result::ok)
     }
 }
 
 impl<T> FusedStream for ReceiveOnce<T> {
     fn is_terminated(&self) -> bool {
-        unsafe { self.channel.as_ref() }.is_done()
+        self.channel.as_ref().map(|c| c.is_done()).unwrap_or(true)
     }
 }
+
+impl<T> Unpin for ReceiveOnce<T> {}
 
 /// Created by [`channel()`] and used to dispatch a stream of values to a
 /// an associated [`Receiver`].
@@ -594,28 +590,26 @@ impl<T> Sender<T> {
         self.channel.map(|c| c.is_done()).unwrap_or(true)
     }
 
-    /// Send the next result, returning a `Future` which can be used to await
-    /// its delivery.
-    pub fn send(&mut self, value: T) -> TrackSend<'_, T> {
-        TrackSend {
-            channel: self.channel.into(),
-            value: Some(value).into(),
-            drops: false,
-            _marker: PhantomData,
-        }
-    }
-
     /// Send a single result and consume the [`Sender`].
-    pub fn into_send(self, value: T) -> Result<(), T> {
+    pub fn send_nowait(self, value: T) -> Result<(), T> {
         if let Some(channel) = ManuallyDrop::new(self).channel {
-            channel.send(value, None).map_err(|(result, drop_channel)| {
-                if drop_channel {
-                    drop(unsafe { channel.into_box() });
-                }
-                result
+            channel.write(value, None, true).map_err(|value| {
+                drop(unsafe { channel.into_box() });
+                value
             })
         } else {
             Err(value)
+        }
+    }
+
+    /// Send the next result, returning a `Future` which can be used to await
+    /// its delivery.
+    pub fn send(&mut self, value: T) -> Flush<'_, T> {
+        Flush {
+            channel: self.channel,
+            value: Some(value),
+            finalize: false,
+            _marker: PhantomData,
         }
     }
 }
@@ -623,29 +617,35 @@ impl<T> Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         if let Some(channel) = self.channel.take() {
-            if channel.cancel_send() {
+            if channel.drop_one_side(true) {
                 drop(unsafe { channel.into_box() });
             }
         }
     }
 }
 
+impl<T> Unpin for Sender<T> {}
+
 /// Created by [`channel()`] and used to receive a stream of values from
 /// an associated [`Sender`].
 #[derive(Debug)]
 pub struct Receiver<T> {
-    channel: MaybeCopy<Option<BoxPtr<Channel<T>>>>,
+    channel: Option<BoxPtr<Channel<T>>>,
 }
 
 impl<T> Receiver<T> {
     /// Safely cancel the receive operation, consuming the [`Receiver`].
     pub fn cancel(self) -> Option<T> {
-        if let Some(channel) = unsafe { ManuallyDrop::new(self).channel.load() } {
-            let (result, dropped) = channel.cancel_recv();
-            if dropped {
-                drop(unsafe { channel.into_box() });
+        if let Some(channel) = ManuallyDrop::new(self).channel.take() {
+            if let Poll::Ready((result, dropped)) = channel.read(None, true) {
+                if dropped {
+                    drop(unsafe { channel.into_box() });
+                }
+                result
+            } else {
+                // sender has not dropped or produced a value
+                None
             }
-            result
         } else {
             None
         }
@@ -653,16 +653,18 @@ impl<T> Receiver<T> {
 
     /// Try to receive the next value from the stream.
     pub fn try_recv(&mut self) -> Poll<Option<T>> {
-        if let Some(channel) = unsafe { self.channel.load() } {
-            channel.poll_recv(None).map(|(result, dropped)| {
-                if dropped || result.is_some() {
-                    if dropped {
-                        drop(unsafe { channel.into_box() });
-                        unsafe { self.channel.store(None) };
-                    }
+        if let Some(channel) = self.channel.take() {
+            if let Poll::Ready((result, dropped)) = channel.read(None, false) {
+                if dropped {
+                    drop(unsafe { channel.into_box() });
+                } else {
+                    self.channel.replace(channel);
                 }
-                result
-            })
+                Poll::Ready(result)
+            } else {
+                self.channel.replace(channel);
+                Poll::Pending
+            }
         } else {
             Poll::Ready(None)
         }
@@ -671,11 +673,12 @@ impl<T> Receiver<T> {
     /// Block the current thread on the next result from the [`Sender`], returning
     /// [`None`] if the sender has been dropped.
     pub fn wait_next(&mut self) -> Option<T> {
-        if let Some(channel) = unsafe { self.channel.load() } {
-            let (result, dropped) = channel.wait_recv();
+        if let Some(channel) = self.channel.take() {
+            let (result, dropped) = channel.wait_read();
             if dropped {
                 drop(unsafe { channel.into_box() });
-                unsafe { self.channel.replace(None) };
+            } else {
+                self.channel.replace(channel);
             }
             result
         } else {
@@ -686,28 +689,28 @@ impl<T> Receiver<T> {
     /// Block the current thread on the next result from the [`Sender`], returning
     /// `Ok(None)`] if the sender has been dropped and `Err(Incomplete)` if the
     /// provided timeout is reached.
-    pub fn wait_next_timeout(&mut self, timeout: impl Expiry) -> Result<Option<T>, TimedOut> {
-        if let Some(channel) = unsafe { self.channel.load() } {
-            let (result, dropped) = channel.wait_recv_timeout(timeout.into_expire());
+    pub fn wait_next_timeout(&mut self, timeout: impl Expiry) -> Result<T, RecvError> {
+        if let Some(channel) = self.channel.take() {
+            let (result, dropped) = channel.wait_read_timeout(timeout.into_opt_instant());
             if dropped {
                 drop(unsafe { channel.into_box() });
-                unsafe { self.channel.replace(None) };
+                result.ok_or(RecvError::Incomplete)
+            } else if let Some(result) = result {
                 Ok(result)
-            } else if result.is_none() {
-                Err(TimedOut)
             } else {
-                Ok(result)
+                self.channel.replace(channel);
+                Err(RecvError::TimedOut)
             }
         } else {
-            Ok(None)
+            Err(RecvError::Terminated)
         }
     }
 }
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        if let Some(channel) = unsafe { self.channel.load() } {
-            if channel.cancel_recv().1 {
+        if let Some(channel) = self.channel.take() {
+            if channel.drop_one_side(false) {
                 drop(unsafe { channel.into_box() });
             }
         }
@@ -717,15 +720,17 @@ impl<T> Drop for Receiver<T> {
 impl<T> Stream for Receiver<T> {
     type Item = T;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        if let Some(channel) = unsafe { self.channel.load() } {
-            channel.poll_recv(Some(cx)).map(|(result, dropped)| {
-                if dropped {
-                    drop(unsafe { channel.into_box() });
-                    unsafe { self.channel.store(None) };
-                }
-                result
-            })
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        if let Some(channel) = self.channel.clone() {
+            channel
+                .read(Some(cx.waker()), false)
+                .map(|(result, dropped)| {
+                    if dropped {
+                        self.channel.take();
+                        drop(unsafe { channel.into_box() });
+                    }
+                    result
+                })
         } else {
             Poll::Ready(None)
         }
@@ -734,8 +739,8 @@ impl<T> Stream for Receiver<T> {
 
 impl<T> FusedStream for Receiver<T> {
     fn is_terminated(&self) -> bool {
-        unsafe { self.channel.load() }
-            .map(|c| c.is_done())
-            .unwrap_or(true)
+        self.channel.as_ref().map(|c| c.is_done()).unwrap_or(true)
     }
 }
+
+impl<T> Unpin for Receiver<T> {}

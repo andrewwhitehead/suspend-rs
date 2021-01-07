@@ -46,7 +46,7 @@ fn channel_send_receive_poll() {
     let mut cx = Context::from_waker(&wr);
     assert_eq!(Pin::new(&mut receiver).poll_next(&mut cx), Poll::Pending);
     assert_eq!(waker.count(), 0);
-    assert_eq!(sender.into_send(message), Ok(()));
+    assert_eq!(sender.send_nowait(message), Ok(()));
     assert_eq!(waker.count(), 1);
     assert_eq!(receiver.is_terminated(), false);
     assert_eq!(drops.count(), 0);
@@ -72,21 +72,21 @@ fn channel_send_receive_poll() {
 #[test]
 fn channel_send_receive_block_on() {
     let (sender, mut receiver) = channel();
-    assert_eq!(sender.into_send(1u32), Ok(()));
+    assert_eq!(sender.send_nowait(1u32), Ok(()));
     assert_eq!(block_on(receiver.next()), Some(1u32));
 }
 
 #[test]
 fn channel_send_receive_wait_next() {
     let (sender, mut receiver) = channel();
-    assert_eq!(sender.into_send(1u32), Ok(()));
+    assert_eq!(sender.send_nowait(1u32), Ok(()));
     assert_eq!(receiver.wait_next(), Some(1u32));
 }
 
 #[test]
 fn channel_send_receive_thread() {
     let (sender, mut receiver) = channel();
-    let ta = thread::spawn(move || sender.into_send(1u32).unwrap());
+    let ta = thread::spawn(move || sender.send_nowait(1u32).unwrap());
     assert_eq!(block_on(receiver.next()), Some(1u32));
     ta.join().unwrap();
 }
@@ -97,10 +97,10 @@ fn channel_send_receive_forward_thread() {
     let (sender1, mut receiver1) = channel();
     let ta = thread::spawn(move || {
         sender1
-            .into_send(block_on(receiver0.next()).unwrap())
+            .send_nowait(block_on(receiver0.next()).unwrap())
             .unwrap()
     });
-    let tb = thread::spawn(move || sender0.into_send(1u32).unwrap());
+    let tb = thread::spawn(move || sender0.send_nowait(1u32).unwrap());
     assert_eq!(block_on(receiver1.next()), Some(1u32));
     ta.join().unwrap();
     tb.join().unwrap();
@@ -140,14 +140,14 @@ fn channel_sender_dropped() {
 fn channel_receiver_dropped_early() {
     let (sender, receiver) = channel();
     drop(receiver);
-    assert_eq!(sender.into_send(1u32), Err(1u32));
+    assert_eq!(sender.send_nowait(1u32), Err(1u32));
 }
 
 #[test]
 fn channel_receiver_dropped_incomplete() {
     let (sender, receiver) = channel();
     let (message, drops) = TestDrop::new_pair();
-    sender.into_send(message).unwrap();
+    sender.send_nowait(message).unwrap();
     assert_eq!(drops.count(), 0);
     //assert!(receiver.wait().is_ok());
     drop(receiver);
@@ -158,7 +158,7 @@ fn channel_receiver_dropped_incomplete() {
 fn channel_receiver_dropped_complete() {
     let (sender, mut receiver) = channel();
     let (message, drops) = TestDrop::new_pair();
-    sender.into_send(message).unwrap();
+    sender.send_nowait(message).unwrap();
     let result = block_on(receiver.next()).unwrap();
     assert_eq!(drops.count(), 0);
     drop(result);
@@ -170,21 +170,21 @@ fn channel_receiver_dropped_complete() {
 #[test]
 fn channel_receiver_block_on() {
     let (sender, mut receiver) = channel::<u32>();
-    sender.into_send(5).unwrap();
+    sender.send_nowait(5).unwrap();
     assert_eq!(block_on(receiver.next()), Some(5));
 }
 
 #[test]
 fn channel_receiver_wait_next() {
     let (sender, mut receiver) = channel::<u32>();
-    sender.into_send(5).unwrap();
+    sender.send_nowait(5).unwrap();
     assert_eq!(receiver.wait_next(), Some(5));
 }
 
 #[test]
 fn channel_receiver_stream_one() {
     let (sender, mut receiver) = channel::<u32>();
-    sender.into_send(5).unwrap();
+    sender.send_nowait(5).unwrap();
     assert_eq!(receiver.is_terminated(), false);
     assert_eq!(block_on(receiver.next()), Some(5));
     assert_eq!(receiver.is_terminated(), true);
@@ -205,12 +205,12 @@ fn channel_receiver_stream_empty() {
 fn channel_receiver_cancel_early() {
     let (sender, receiver) = channel::<u32>();
     assert_eq!(receiver.cancel(), None);
-    assert!(sender.into_send(5).is_err());
+    assert!(sender.send_nowait(5).is_err());
 }
 
 #[test]
 fn channel_receiver_cancel_late() {
     let (sender, receiver) = channel::<u32>();
-    sender.into_send(5).unwrap();
+    sender.send_nowait(5).unwrap();
     assert_eq!(receiver.cancel(), Some(5));
 }
