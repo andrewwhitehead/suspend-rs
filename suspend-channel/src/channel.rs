@@ -16,12 +16,12 @@ use suspend_core::{listen::block_on_poll, util::BoxPtr, Expiry};
 use super::error::RecvError;
 use super::util::Maybe;
 
-const STATE_DONE: u8 = 0b0000;
-const STATE_ACTIVE: u8 = 0b0001;
-const STATE_LOADED: u8 = 0b0100;
-const STATE_WLOCK: u8 = 0b10000;
-const STATE_RLOCK: u8 = 0b100000;
-const STATE_WAKE: u8 = 0b1000;
+const STATE_DONE: u8 = 0b00000;
+const STATE_ACTIVE: u8 = 0b00001;
+const STATE_LOADED: u8 = 0b00010;
+const STATE_WLOCK: u8 = 0b00100;
+const STATE_RLOCK: u8 = 0b01000;
+const STATE_WAKE: u8 = 0b10000;
 
 /// Create a channel for sending a single value between a producer and consumer.
 pub fn send_once<T>() -> (SendOnce<T>, ReceiveOnce<T>) {
@@ -304,7 +304,9 @@ impl<T> Channel<T> {
             result
         }
         // poll with a listener
-        else if let Poll::Ready(result) = self.block_on_read(None) {
+        else if let Poll::Ready(result) =
+            block_on_poll(|cx| self.read(Some(cx.waker()), false), None)
+        {
             result
         } else {
             unreachable!()
@@ -317,7 +319,7 @@ impl<T> Channel<T> {
             return result;
         }
         // poll with a listener
-        match self.block_on_read(timeout) {
+        match block_on_poll(|cx| self.read(Some(cx.waker()), false), timeout) {
             Poll::Ready(result) => result,
             Poll::Pending => {
                 // cancel read - return value if any was stored
@@ -328,11 +330,6 @@ impl<T> Channel<T> {
                 }
             }
         }
-    }
-
-    #[inline]
-    fn block_on_read(&self, timeout: Option<Instant>) -> Poll<(Option<T>, bool)> {
-        block_on_poll(|cx| self.read(Some(cx.waker()), false), timeout)
     }
 }
 
@@ -402,6 +399,7 @@ impl<T> Future for Flush<'_, T> {
 }
 
 impl<T> FusedFuture for Flush<'_, T> {
+    #[inline]
     fn is_terminated(&self) -> bool {
         self.channel.is_none()
     }
@@ -418,6 +416,7 @@ pub struct SendOnce<T> {
 
 impl<T> SendOnce<T> {
     /// Check if the receiver has already been dropped.
+    #[inline]
     pub fn is_canceled(&self) -> bool {
         self.channel.is_done()
     }
@@ -433,6 +432,7 @@ impl<T> SendOnce<T> {
 
     /// Load a value to be sent, returning a [`Future`] which resolves when
     /// the value is received or the [`ReceiveOnce`] is dropped.
+    #[inline]
     pub fn send(self, value: T) -> Flush<'static, T> {
         Flush {
             channel: Some(ManuallyDrop::new(self).channel),
@@ -550,12 +550,14 @@ impl<T> Drop for ReceiveOnce<T> {
 impl<T> Future for ReceiveOnce<T> {
     type Output = Result<T, RecvError>;
 
+    #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.poll_result(Some(cx.waker()))
     }
 }
 
 impl<T> FusedFuture for ReceiveOnce<T> {
+    #[inline]
     fn is_terminated(&self) -> bool {
         self.channel.as_ref().map(|c| c.is_done()).unwrap_or(true)
     }
@@ -564,12 +566,14 @@ impl<T> FusedFuture for ReceiveOnce<T> {
 impl<T> Stream for ReceiveOnce<T> {
     type Item = T;
 
+    #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_result(Some(cx.waker())).map(Result::ok)
     }
 }
 
 impl<T> FusedStream for ReceiveOnce<T> {
+    #[inline]
     fn is_terminated(&self) -> bool {
         self.channel.as_ref().map(|c| c.is_done()).unwrap_or(true)
     }
@@ -586,6 +590,7 @@ pub struct Sender<T> {
 
 impl<T> Sender<T> {
     /// Check if the receiver has already been dropped.
+    #[inline]
     pub fn is_canceled(&self) -> bool {
         self.channel.map(|c| c.is_done()).unwrap_or(true)
     }
@@ -604,6 +609,7 @@ impl<T> Sender<T> {
 
     /// Send the next result, returning a `Future` which can be used to await
     /// its delivery.
+    #[inline]
     pub fn send(&mut self, value: T) -> Flush<'_, T> {
         Flush {
             channel: self.channel,
@@ -738,6 +744,7 @@ impl<T> Stream for Receiver<T> {
 }
 
 impl<T> FusedStream for Receiver<T> {
+    #[inline]
     fn is_terminated(&self) -> bool {
         self.channel.as_ref().map(|c| c.is_done()).unwrap_or(true)
     }
