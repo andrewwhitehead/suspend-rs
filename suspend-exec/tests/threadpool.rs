@@ -9,7 +9,7 @@ use suspend_core::{
     listen::{block_on, block_on_poll},
     pin,
 };
-use suspend_exec::{ThreadPool, ThreadPoolConfig};
+use suspend_exec::{RecvError, ThreadPool, ThreadPoolConfig};
 
 use self::utils::Track;
 
@@ -20,29 +20,29 @@ fn run_test<T>(test: impl FnOnce() -> T) -> T {
     test()
 }
 
-fn assert_panics_with<T>(msg: &str, test: T) -> ()
-where
-    T: FnOnce() -> thread::Result<()> + panic::UnwindSafe,
-{
-    tracing_subscriber::fmt::try_init().ok();
-    let prev_hook = panic::take_hook();
-    panic::set_hook(Box::new(|_| {}));
-    let result = test();
-    panic::set_hook(prev_hook);
-    if let Err(err) = result {
-        if !err
-            .downcast_ref::<String>()
-            .map(|e| &**e)
-            .or_else(|| err.downcast_ref::<&'static str>().map(|e| *e))
-            .map(|e| e.contains(msg))
-            .unwrap_or(false)
-        {
-            panic::resume_unwind(err)
-        }
-    } else {
-        panic!("Expected panic '{}'", msg);
-    }
-}
+// fn assert_panics_with<T>(msg: &str, test: T) -> ()
+// where
+//     T: FnOnce() -> thread::Result<()> + panic::UnwindSafe,
+// {
+//     tracing_subscriber::fmt::try_init().ok();
+//     let prev_hook = panic::take_hook();
+//     panic::set_hook(Box::new(|_| {}));
+//     let result = test();
+//     panic::set_hook(prev_hook);
+//     if let Err(err) = result {
+//         if !err
+//             .downcast_ref::<String>()
+//             .map(|e| &**e)
+//             .or_else(|| err.downcast_ref::<&'static str>().map(|e| *e))
+//             .map(|e| e.contains(msg))
+//             .unwrap_or(false)
+//         {
+//             panic::resume_unwind(err)
+//         }
+//     } else {
+//         panic!("Expected panic '{}'", msg);
+//     }
+// }
 
 #[test]
 fn thread_pool_unbounded() {
@@ -109,14 +109,15 @@ fn thread_pool_bounded() {
 
 #[test]
 fn thread_pool_panic_run() {
-    assert_panics_with("expected", || {
-        run_test(|| {
-            let pool = ThreadPool::default();
+    run_test(|| {
+        let pool = ThreadPool::default();
+        assert_eq!(
             pool.run(move || {
                 panic!("expected");
             })
-            .join()
-        })
+            .join(),
+            Err(RecvError::Incomplete)
+        )
     })
 }
 
@@ -152,18 +153,19 @@ fn thread_pool_scoped() {
 
 #[test]
 fn thread_pool_panic_scoped() {
-    assert_panics_with("expected", || {
-        run_test(|| {
-            let pool = ThreadPool::default();
-            // all threads joined as scoped() ends
+    run_test(|| {
+        let pool = ThreadPool::default();
+        // all threads joined as scoped() ends
+        assert_eq!(
             pool.scoped(|scope| {
                 scope
                     .run(|_| {
                         panic!("expected");
                     })
                     .join()
-            })
-        })
+            }),
+            Err(RecvError::Incomplete)
+        );
     })
 }
 
@@ -193,9 +195,11 @@ fn async_scoped_poll_and_drop() {
         let fut = pool.async_scoped(|scope| {
             let track = track.clone();
             scope.run(move |_| {
+                println!("1");
                 track.call();
                 // FIXME - breaks in miri without isolation disabled
                 thread::sleep(Duration::from_millis(100));
+                println!("2");
                 track.call();
             });
         });

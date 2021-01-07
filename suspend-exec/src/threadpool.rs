@@ -7,21 +7,20 @@ use core::{
     task::{Context, Poll},
     time::Duration,
 };
-use std::{
-    collections::VecDeque,
-    marker::PhantomData,
-    panic,
-    sync::{Condvar, Mutex, MutexGuard},
-    thread,
-};
+use std::{collections::VecDeque, marker::PhantomData, panic, thread};
 
-use suspend_channel::{send_once, ReceiveOnce, RecvError};
-use suspend_core::shared::{PinShared, Ref, ScopedRef, Shared, SharedRef};
+use suspend_channel::{
+    send_once,
+    task::{task_fn, JoinTask, TaskFn, TaskResult},
+    ReceiveOnce, RecvError,
+};
+use suspend_core::{
+    lock::{Lock, LockGuard},
+    shared::{PinShared, Ref, ScopedRef, Shared, SharedRef},
+};
 use tracing::info;
 
 static DEFAULT_THREAD_NAME: &'static str = "threadpool";
-
-type Runnable<'s> = Box<(dyn FnOnce() -> bool + Send + panic::UnwindSafe + 's)>;
 
 pub struct ThreadPoolConfig {
     idle_timeout: Option<Duration>,
@@ -75,14 +74,13 @@ impl ThreadPool {
     pub fn new(config: ThreadPoolConfig) -> Self {
         let slf = Self {
             inner: Shared::new(ThreadPoolInner {
-                state: Mutex::new(ThreadPoolState {
+                state: Lock::new(ThreadPoolState {
                     idle_count: 0,
                     panic_count: 0,
                     thread_count: 0,
                     queue: VecDeque::new(),
                     shutdown: false,
                 }),
-                queue_cvar: Condvar::new(),
                 idle_timeout: config.idle_timeout,
                 thread_min_count: config.min_count,
                 thread_max_count: config.max_count,
@@ -116,8 +114,8 @@ impl ThreadPool {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let (runnable, join) = JoinTask::new_pair(f);
-        ThreadPoolInner::run_boxed(self.inner.scoped_ref(), runnable);
+        let (task, join) = task_fn(f);
+        ThreadPoolInner::run_boxed(self.inner.scoped_ref(), task);
         join
     }
 
@@ -133,7 +131,7 @@ impl ThreadPool {
         share.with(|s| f(Scope::new(s)))
     }
 
-    pub async fn async_scoped<'s, F, T>(&'s self, f: F) -> thread::Result<T>
+    pub async fn async_scoped<'s, F, T>(&'s self, f: F) -> TaskResult<T>
     where
         F: FnOnce(Scope<'s>) -> T + Send + 's,
         T: Send + 's,
@@ -141,7 +139,7 @@ impl ThreadPool {
         let mut share = PinShared::new(self.inner.borrow());
         share
             .async_with(|s| {
-                let (runnable, join) = JoinTask::new_pair({
+                let (runnable, join) = task_fn({
                     let s = s.clone();
                     move || f(Scope::new(s))
                 });
@@ -170,17 +168,16 @@ impl Drop for ThreadPool {
             .state
             .lock()
             .expect("Error locking threadpool mutex");
-        info!("drop inner");
+
+        info!("drop pool inner");
         state.shutdown = true;
         drop(state);
 
         // notify any waiting threads to discover shutdown state
-        self.inner.queue_cvar.notify_all();
+        self.inner.state.notify_all();
 
         // block until all references have been dropped (all threads have exited)
-        if !self.inner.collect(Duration::from_secs(1)).unwrap() {
-            panic!("timed out {}", self.inner.borrow_count());
-        }
+        self.inner.collect(None).unwrap();
 
         info!("dropped pool");
     }
@@ -193,8 +190,7 @@ impl From<ThreadPoolConfig> for ThreadPool {
 }
 
 struct ThreadPoolInner {
-    state: Mutex<ThreadPoolState>,
-    queue_cvar: Condvar,
+    state: Lock<ThreadPoolState>,
     idle_timeout: Option<Duration>,
     thread_min_count: usize,
     thread_max_count: Option<usize>,
@@ -214,13 +210,11 @@ impl ThreadPoolInner {
         thread::Builder::new().name(name)
     }
 
-    fn run_boxed(inner: Ref<'_, Self>, f: Runnable<'static>) {
-        info!("lock");
+    fn run_boxed(inner: Ref<'_, Self>, task: TaskFn<'static>) {
         let mut state = inner.state.lock().unwrap();
-        state.queue.push_back(f);
-        info!("queue");
+        state.queue.push_back(task);
         if !ThreadPoolInner::maybe_spawn(inner, state) {
-            inner.queue_cvar.notify_one();
+            inner.state.notify_one();
         }
     }
 
@@ -228,6 +222,7 @@ impl ThreadPoolInner {
         info!("start worker thread");
         let mut tasks = 0usize;
         let mut state = inner.state.lock().unwrap();
+        let mut panic_err: Option<Box<dyn Any + Send + 'static>> = None;
 
         loop {
             if state.shutdown {
@@ -238,28 +233,28 @@ impl ThreadPoolInner {
                 state.idle_count -= 1;
                 Self::maybe_spawn(inner.scoped_ref(), state);
 
-                info!("task");
                 tasks += 1;
-                let failed = task();
-                info!("done task");
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| task.run())) {
+                    panic_err.replace(e);
+                }
 
                 state = inner.state.lock().unwrap();
                 state.idle_count += 1;
-                if failed {
+                if panic_err.is_some() {
                     // shut down the thread if the task panicked
                     info!("worker thread panicked");
                     state.panic_count += 1;
                     break;
                 }
             } else if let Some(timeout) = inner.idle_timeout {
-                let (guard, wait_result) = inner.queue_cvar.wait_timeout(state, timeout).unwrap();
+                let (guard, timed_out) = state.wait(timeout).unwrap();
                 state = guard;
-                if wait_result.timed_out() && state.thread_count > inner.thread_min_count {
+                if timed_out && state.thread_count > inner.thread_min_count {
                     info!("worker thread timed out");
                     break;
                 }
             } else {
-                state = inner.queue_cvar.wait(state).unwrap();
+                state = state.wait(None).unwrap().0;
             }
         }
 
@@ -272,12 +267,16 @@ impl ThreadPoolInner {
             tasks,
             thread::current().name().unwrap()
         );
+
+        if let Some(err) = panic_err {
+            panic::resume_unwind(err);
+        }
     }
 
-    fn maybe_spawn(inner: Ref<'_, Self>, mut state: MutexGuard<'_, ThreadPoolState>) -> bool {
+    fn maybe_spawn(inner: Ref<'_, Self>, mut state: LockGuard<'_, ThreadPoolState>) -> bool {
         let idle_count = state.idle_count;
-        let thread_count = state.thread_count;
         if idle_count == 0 || idle_count * 5 < state.queue.len() {
+            let thread_count = state.thread_count;
             if thread_count == 0
                 || inner
                     .thread_max_count
@@ -289,7 +288,7 @@ impl ThreadPoolInner {
                 drop(state);
 
                 let builder = inner.build_thread();
-                inner.queue_cvar.notify_all();
+                inner.state.notify_all();
                 builder
                     .spawn({
                         let inner = inner.borrow();
@@ -307,7 +306,7 @@ struct ThreadPoolState {
     idle_count: usize,
     panic_count: usize,
     thread_count: usize,
-    queue: VecDeque<Runnable<'static>>,
+    queue: VecDeque<TaskFn<'static>>,
     shutdown: bool,
 }
 
@@ -333,7 +332,7 @@ impl<'s> Scope<'s> {
         F: FnOnce(Scope<'s>) -> T + Send + 's,
         T: Send + 's,
     {
-        let (runnable, join) = JoinTask::new_pair({
+        let (runnable, join) = task_fn({
             let scope = Scope::new(self.inner.clone());
             move || f(scope)
         });
@@ -343,64 +342,5 @@ impl<'s> Scope<'s> {
             unsafe { mem::transmute(runnable) },
         );
         join
-    }
-}
-
-#[derive(Debug)]
-pub struct JoinTask<'t, T> {
-    handle: Option<thread::JoinHandle<()>>,
-    result: ReceiveOnce<thread::Result<T>>,
-    _marker: PhantomData<&'t ()>,
-}
-
-impl<'t, T> JoinTask<'t, T> {
-    pub fn new_pair<F>(task: F) -> (Runnable<'t>, JoinTask<'t, T>)
-    where
-        F: FnOnce() -> T + Send + 't,
-        T: Send + 't,
-    {
-        let (sender, result) = send_once();
-        let runnable = Box::new(panic::AssertUnwindSafe(move || {
-            let caught = panic::catch_unwind(panic::AssertUnwindSafe(task));
-            let panicked = caught.is_err();
-            sender.send_nowait(caught).ok();
-            panicked
-        }));
-        let join = Self {
-            handle: None,
-            result,
-            _marker: PhantomData,
-        };
-        (runnable, join)
-    }
-
-    pub fn join(mut self) -> thread::Result<T> {
-        let result = if let Some(handle) = self.handle.take() {
-            handle.join().unwrap();
-            self.result.try_recv().unwrap()
-        } else {
-            self.result.recv()
-        };
-        task_result(result)
-    }
-
-    // TODO: add join_timeout
-}
-
-impl<'t, T> Future for JoinTask<'t, T> {
-    type Output = thread::Result<T>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        unsafe { self.map_unchecked_mut(|join| &mut join.result) }
-            .poll(cx)
-            .map(task_result)
-    }
-}
-
-#[inline]
-fn task_result<T>(result: Result<thread::Result<T>, RecvError>) -> thread::Result<T> {
-    match result {
-        Ok(r) => r,
-        Err(inc) => Err(Box::new(inc) as Box<dyn Any + Send + 'static>),
     }
 }
