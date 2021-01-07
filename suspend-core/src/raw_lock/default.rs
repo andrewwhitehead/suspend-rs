@@ -58,8 +58,13 @@ impl RawLock for LockImpl {
     }
 
     #[inline]
-    fn notify(&self) {
+    fn notify_one(&self) {
         self.cond.notify_one();
+    }
+
+    #[inline]
+    fn notify_all(&self) {
+        self.cond.notify_all();
     }
 }
 

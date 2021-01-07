@@ -21,6 +21,12 @@ impl<T> BoxPtr<T> {
     {
         Self::new(Box::new(value))
     }
+
+    /// Deallocate the `Box<T>` pointed to by this pointer
+    #[inline]
+    pub unsafe fn dealloc(self) {
+        drop(Box::from_raw(self.0.as_ptr()))
+    }
 }
 
 impl<T: ?Sized> BoxPtr<T> {
@@ -56,7 +62,7 @@ impl<T: ?Sized> BoxPtr<T> {
         )
     }
 
-    /// Unwrap the `Box<T>` pointed to by this `BoxPtr<T>`. The caller is responsible
+    /// Unwrap the value pointed to by this `BoxPtr<T>`. The caller is responsible
     /// for ensuring that no additional references exist
     #[inline]
     pub unsafe fn into_box(self) -> Box<T> {

@@ -45,6 +45,16 @@ impl<T> Lock<T> {
         })
     }
 
+    /// Notify a single listener of the Condvar
+    pub fn notify_one(&self) {
+        self.raw.notify_one()
+    }
+
+    /// Notify all listeners of the Condvar
+    pub fn notify_all(&self) {
+        self.raw.notify_all()
+    }
+
     /// Unwrap the Lock<T>, returning the inner value
     #[inline]
     pub fn into_inner(self) -> T {

@@ -242,7 +242,7 @@ impl ListenInner {
     #[inline]
     pub fn dec_count_drop(inner: BoxPtr<Self>) {
         if unsafe { inner.to_ref() }.dec_count() == 0 {
-            drop(unsafe { inner.into_box() })
+            drop(unsafe { inner.dealloc() })
         }
     }
 

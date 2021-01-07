@@ -43,7 +43,9 @@ pub trait RawLock: RawInit + for<'g> HasGuard<'g> {
 
     fn try_lock(&self) -> Result<<Self as HasGuard<'_>>::Guard, LockError>;
 
-    fn notify(&self);
+    fn notify_one(&self);
+
+    fn notify_all(&self);
 }
 
 // This should not be needed once GATs are available

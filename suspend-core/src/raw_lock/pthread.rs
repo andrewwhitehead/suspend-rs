@@ -91,8 +91,14 @@ impl RawLock for LockImpl {
     }
 
     #[inline]
-    fn notify(&self) {
+    fn notify_one(&self) {
         let r = unsafe { libc::pthread_cond_signal(self.cond.get()) };
+        assert_eq!(r, 0);
+    }
+
+    #[inline]
+    fn notify_all(&self) {
+        let r = unsafe { libc::pthread_cond_broadcast(self.cond.get()) };
         assert_eq!(r, 0);
     }
 }
@@ -269,7 +275,7 @@ impl RawParker for ParkImpl {
                 // between setting the state and waiting on the condvar
                 drop(self.lock.lock().unwrap());
                 // wake the parked thread
-                self.lock.notify();
+                self.lock.notify_one();
             }
             true
         } else {

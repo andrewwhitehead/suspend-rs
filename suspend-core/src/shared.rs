@@ -8,9 +8,7 @@ use core::{
     ops::Deref,
     sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
 };
-use std::time::{Duration, Instant};
-
-use tracing::info;
+use std::time::Instant;
 
 use crate::{
     error::LockError,
@@ -26,7 +24,6 @@ pub fn with_scope<F, R>(f: F) -> R
 where
     F: FnOnce(ScopedRef<()>) -> R,
 {
-    // info!("create scope");
     let mut scope = PinShared::new(());
     scope.with(f)
 }
@@ -38,7 +35,6 @@ where
     F: FnOnce(ScopedRef<()>) -> Fut,
     Fut: Future<Output = R>,
 {
-    info!("create async scope");
     let mut scope = PinShared::new(());
     scope.async_with(f).await
 }
@@ -46,7 +42,7 @@ where
 /// A shared value which can be borrowed by multiple threads and later
 /// collected
 #[derive(Debug)]
-pub struct Shared<T: ?Sized> {
+pub struct Shared<T> {
     inner: BoxPtr<SharedInner<T>>,
 }
 
@@ -60,12 +56,13 @@ impl<T> Shared<T> {
     }
 
     /// Create a new shared reference to the contained value
+    #[inline]
     pub fn borrow(&self) -> SharedRef<T> {
         SharedRef::new(self.inner)
     }
 
     /// Create a temporary reference without increasing the borrow count
-    pub fn scoped_ref(&self) -> Ref<'_, T> {
+    pub const fn scoped_ref(&self) -> Ref<'_, T> {
         Ref {
             inner: self.inner,
             _marker: PhantomData,
@@ -91,7 +88,7 @@ impl<T> Shared<T> {
     }
 }
 
-impl<T: ?Sized> Deref for Shared<T> {
+impl<T> Deref for Shared<T> {
     type Target = T;
 
     #[inline]
@@ -100,17 +97,16 @@ impl<T: ?Sized> Deref for Shared<T> {
     }
 }
 
-impl<T: ?Sized> Drop for Shared<T> {
+impl<T> Drop for Shared<T> {
     fn drop(&mut self) {
         unsafe {
-            info!("drop shared");
             SharedInner::drop_shared(self.inner);
         }
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct SharedInner<T: ?Sized> {
+pub(crate) struct SharedInner<T> {
     count: AtomicUsize,
     parker: NativeParker,
     value: T,
@@ -136,7 +132,7 @@ impl<T> SharedInner<T> {
     }
 }
 
-impl<T: ?Sized> SharedInner<T> {
+impl<T> SharedInner<T> {
     const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 
     #[inline]
@@ -148,7 +144,7 @@ impl<T: ?Sized> SharedInner<T> {
     pub unsafe fn drop_shared(slf: BoxPtr<Self>) {
         if slf.to_ref().count.fetch_sub(3, Ordering::Release) == 3 {
             fence(Ordering::Acquire);
-            drop(slf.into_box())
+            slf.dealloc();
         }
     }
 
@@ -159,10 +155,8 @@ impl<T: ?Sized> SharedInner<T> {
         }
     }
 
-    #[inline]
     pub unsafe fn dec_count_ref(slf: *const Self) -> bool {
         let inner = &*slf;
-        info!("dec count ref");
         // decrease count by two, each reference counts twice
         loop {
             match inner.count.fetch_sub(2, Ordering::Release) - 2 {
@@ -261,14 +255,13 @@ impl<T: ?Sized> SharedInner<T> {
 
 /// A tracking value which notifies its source when dropped
 #[derive(Debug)]
-pub struct SharedRef<T: ?Sized> {
+pub struct SharedRef<T> {
     inner: BoxPtr<SharedInner<T>>,
 }
 
-unsafe impl<T: ?Sized + Send> Send for SharedRef<T> {}
+unsafe impl<T: Send> Send for SharedRef<T> {}
 
-impl<T: ?Sized> SharedRef<T> {
-    #[inline]
+impl<T> SharedRef<T> {
     pub(crate) fn new(inner: BoxPtr<SharedInner<T>>) -> Self {
         unsafe { SharedInner::inc_count_ref(inner.to_ptr()) };
         SharedRef { inner }
@@ -281,7 +274,7 @@ impl<T: ?Sized> SharedRef<T> {
     }
 
     /// Create a temporary reference without increasing the borrow count
-    pub fn scoped_ref(&self) -> Ref<'_, T> {
+    pub const fn scoped_ref(&self) -> Ref<'_, T> {
         Ref {
             inner: self.inner,
             _marker: PhantomData,
@@ -289,13 +282,14 @@ impl<T: ?Sized> SharedRef<T> {
     }
 }
 
-impl<T: ?Sized> Clone for SharedRef<T> {
+impl<T> Clone for SharedRef<T> {
+    #[inline]
     fn clone(&self) -> Self {
         Self::new(self.inner)
     }
 }
 
-impl<T: ?Sized> Deref for SharedRef<T> {
+impl<T> Deref for SharedRef<T> {
     type Target = T;
 
     #[inline]
@@ -304,29 +298,27 @@ impl<T: ?Sized> Deref for SharedRef<T> {
     }
 }
 
-impl<T: ?Sized> Drop for SharedRef<T> {
-    #[inline]
+impl<T> Drop for SharedRef<T> {
     fn drop(&mut self) {
         unsafe {
             if SharedInner::dec_count_ref(self.inner.to_ptr()) {
-                info!("drop shared ref");
-                drop(self.inner.into_box())
+                self.inner.dealloc()
             }
         }
     }
 }
 
-/// A tracking value which notifies its source when dropped
+/// A temporary reference to a shared value
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct Ref<'s, T: ?Sized> {
+pub struct Ref<'s, T> {
     inner: BoxPtr<SharedInner<T>>,
     _marker: PhantomData<&'s ()>,
 }
 
-unsafe impl<T: ?Sized + Send> Send for Ref<'_, T> {}
+unsafe impl<T: Send> Send for Ref<'_, T> {}
 
-impl<T: ?Sized> Ref<'_, T> {
+impl<T> Ref<'_, T> {
     /// Get the current number of borrows, including this one
     #[inline]
     pub fn borrow_count(&self) -> usize {
@@ -340,7 +332,7 @@ impl<T: ?Sized> Ref<'_, T> {
     }
 }
 
-impl<T: ?Sized> Clone for Ref<'_, T> {
+impl<T> Clone for Ref<'_, T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner,
@@ -348,9 +340,9 @@ impl<T: ?Sized> Clone for Ref<'_, T> {
         }
     }
 }
-impl<T: ?Sized> Copy for Ref<'_, T> {}
+impl<T> Copy for Ref<'_, T> {}
 
-impl<T: ?Sized> Deref for Ref<'_, T> {
+impl<T> Deref for Ref<'_, T> {
     type Target = T;
 
     #[inline]
@@ -389,7 +381,6 @@ impl<T> PinShared<T> {
     /// Evaluate a function in the context of the shared value. This method will
     /// block until all borrows of the value are dropped, allowing them to be safely
     /// passed to other threads.
-    #[inline]
     pub fn with<'s, R>(&'s mut self, f: impl FnOnce(ScopedRef<T>) -> R) -> R {
         let _collect = CollectOnDrop(&self.inner);
         f(ScopedRef::new(&self.inner))
@@ -406,18 +397,7 @@ struct CollectOnDrop<'s, T>(&'s SharedInner<T>);
 
 impl<T> Drop for CollectOnDrop<'_, T> {
     fn drop(&mut self) {
-        if self
-            .0
-            .collect(Some(Instant::now() + Duration::from_millis(500)))
-            .unwrap()
-            == false
-        {
-            panic!(
-                "timed out on collect {}",
-                self.0.count.load(Ordering::Acquire)
-            );
-        }
-        info!("drop scope");
+        self.0.collect(None).unwrap();
     }
 }
 
@@ -460,7 +440,6 @@ impl<T> Deref for ScopedRef<T> {
 }
 
 impl<T> Drop for ScopedRef<T> {
-    #[inline]
     fn drop(&mut self) {
         unsafe { SharedInner::dec_count_ref(self.inner) };
     }
