@@ -357,8 +357,10 @@ impl<T> Drop for Flush<'_, T> {
     fn drop(&mut self) {
         if let Some(channel) = self.channel.take() {
             if self.finalize {
-                if unsafe { channel.to_ref() }.drop_one_side(true) {
-                    drop(unsafe { channel.into_box() });
+                unsafe {
+                    if channel.to_ref().drop_one_side(true) {
+                        channel.dealloc();
+                    }
                 }
             }
             // else: try to take the value out of the channel? otherwise
@@ -377,7 +379,7 @@ impl<T> Future for Flush<'_, T> {
                 unsafe { channel.to_ref() }.write(value, Some(cx.waker()), self.finalize)
             {
                 if self.finalize {
-                    drop(unsafe { channel.into_box() });
+                    unsafe { channel.dealloc() };
                 }
                 Poll::Ready(Err(value))
             } else {
@@ -389,7 +391,7 @@ impl<T> Future for Flush<'_, T> {
                 unsafe { channel.to_ref() }.flush(cx.waker(), self.finalize)
             {
                 if dropped && self.finalize {
-                    drop(unsafe { channel.into_box() });
+                    unsafe { channel.dealloc() };
                 }
                 Poll::Ready(result.map(Err).unwrap_or(Ok(())))
             } else {
@@ -431,7 +433,7 @@ impl<T> SendOnce<T> {
         unsafe { channel.to_ref() }
             .write(value, None, true)
             .map_err(|value| {
-                drop(unsafe { channel.into_box() });
+                unsafe { channel.dealloc() };
                 value
             })
     }
@@ -453,7 +455,7 @@ impl<T> Drop for SendOnce<T> {
     fn drop(&mut self) {
         unsafe {
             if self.channel.to_ref().drop_one_side(true) {
-                drop(self.channel.into_box());
+                self.channel.dealloc();
             }
         }
     }
@@ -474,7 +476,7 @@ impl<T> ReceiveOnce<T> {
         ManuallyDrop::new(self).channel.take().and_then(|channel| {
             if let Poll::Ready((result, dropped)) = unsafe { channel.to_ref() }.read(None, true) {
                 if dropped {
-                    drop(unsafe { channel.into_box() });
+                    unsafe { channel.dealloc() };
                 }
                 result
             } else {
@@ -499,7 +501,7 @@ impl<T> ReceiveOnce<T> {
         if let Some(channel) = ManuallyDrop::new(self).channel.take() {
             let (result, dropped) = unsafe { channel.to_ref() }.wait_read();
             if dropped {
-                drop(unsafe { channel.into_box() });
+                unsafe { channel.dealloc() };
             }
             result.ok_or(RecvError::Incomplete)
         } else {
@@ -514,7 +516,7 @@ impl<T> ReceiveOnce<T> {
             let (result, dropped) =
                 unsafe { channel.to_ref() }.wait_read_timeout(timeout.into_opt_instant());
             if dropped {
-                drop(unsafe { channel.into_box() });
+                unsafe { channel.dealloc() };
                 result.ok_or(RecvError::Incomplete)
             } else if let Some(result) = result {
                 Ok(result)
@@ -529,15 +531,15 @@ impl<T> ReceiveOnce<T> {
 
     // poll for the result (internal)
     fn poll_result(&mut self, waker: Option<&Waker>) -> Poll<Result<T, RecvError>> {
-        if let Some(channel) = self.channel {
+        if let Some(channel) = self.channel.take() {
             if let Poll::Ready((result, dropped)) = unsafe { channel.to_ref() }.read(waker, false) {
                 if dropped {
-                    self.channel.take();
-                    drop(unsafe { channel.into_box() });
+                    unsafe { channel.dealloc() };
                 }
                 Poll::Ready(result.ok_or(RecvError::Incomplete))
             } else {
                 // sender has not dropped or produced a value
+                self.channel.replace(channel);
                 Poll::Pending
             }
         } else {
@@ -549,8 +551,10 @@ impl<T> ReceiveOnce<T> {
 impl<T> Drop for ReceiveOnce<T> {
     fn drop(&mut self) {
         if let Some(channel) = self.channel.take() {
-            if unsafe { channel.to_ref() }.drop_one_side(false) {
-                drop(unsafe { channel.into_box() });
+            unsafe {
+                if channel.to_ref().drop_one_side(false) {
+                    channel.dealloc();
+                }
             }
         }
     }
@@ -618,7 +622,7 @@ impl<T> Sender<T> {
             unsafe { channel.to_ref() }
                 .write(value, None, true)
                 .map_err(|value| {
-                    drop(unsafe { channel.into_box() });
+                    unsafe { channel.dealloc() };
                     value
                 })
         } else {
@@ -642,8 +646,10 @@ impl<T> Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         if let Some(channel) = self.channel.take() {
-            if unsafe { channel.to_ref() }.drop_one_side(true) {
-                drop(unsafe { channel.into_box() });
+            unsafe {
+                if channel.to_ref().drop_one_side(true) {
+                    channel.dealloc();
+                }
             }
         }
     }
@@ -664,7 +670,7 @@ impl<T> Receiver<T> {
         if let Some(channel) = ManuallyDrop::new(self).channel.take() {
             if let Poll::Ready((result, dropped)) = unsafe { channel.to_ref() }.read(None, true) {
                 if dropped {
-                    drop(unsafe { channel.into_box() });
+                    unsafe { channel.dealloc() };
                 }
                 result
             } else {
@@ -681,7 +687,7 @@ impl<T> Receiver<T> {
         if let Some(channel) = self.channel.take() {
             if let Poll::Ready((result, dropped)) = unsafe { channel.to_ref() }.read(None, false) {
                 if dropped {
-                    drop(unsafe { channel.into_box() });
+                    unsafe { channel.dealloc() };
                 } else {
                     self.channel.replace(channel);
                 }
@@ -701,7 +707,7 @@ impl<T> Receiver<T> {
         if let Some(channel) = self.channel.take() {
             let (result, dropped) = unsafe { channel.to_ref() }.wait_read();
             if dropped {
-                drop(unsafe { channel.into_box() });
+                unsafe { channel.dealloc() };
             } else {
                 self.channel.replace(channel);
             }
@@ -719,7 +725,7 @@ impl<T> Receiver<T> {
             let (result, dropped) =
                 unsafe { channel.to_ref() }.wait_read_timeout(timeout.into_opt_instant());
             if dropped {
-                drop(unsafe { channel.into_box() });
+                unsafe { channel.dealloc() };
                 result.ok_or(RecvError::Incomplete)
             } else if let Some(result) = result {
                 Ok(result)
@@ -736,8 +742,10 @@ impl<T> Receiver<T> {
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         if let Some(channel) = self.channel.take() {
-            if unsafe { channel.to_ref() }.drop_one_side(false) {
-                drop(unsafe { channel.into_box() });
+            unsafe {
+                if channel.to_ref().drop_one_side(false) {
+                    channel.dealloc();
+                }
             }
         }
     }
@@ -753,7 +761,7 @@ impl<T> Stream for Receiver<T> {
                 .map(|(result, dropped)| {
                     if dropped {
                         self.channel.take();
-                        drop(unsafe { channel.into_box() });
+                        unsafe { channel.dealloc() };
                     }
                     result
                 })

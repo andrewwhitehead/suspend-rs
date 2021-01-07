@@ -17,4 +17,6 @@ mod async_stream;
 mod channel;
 mod error;
 
+pub mod task;
+
 mod util;
