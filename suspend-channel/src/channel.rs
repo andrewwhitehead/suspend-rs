@@ -357,7 +357,7 @@ impl<T> Drop for Flush<'_, T> {
     fn drop(&mut self) {
         if let Some(channel) = self.channel.take() {
             if self.finalize {
-                if channel.drop_one_side(true) {
+                if unsafe { channel.to_ref() }.drop_one_side(true) {
                     drop(unsafe { channel.into_box() });
                 }
             }
@@ -373,7 +373,9 @@ impl<T> Future for Flush<'_, T> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(value) = self.value.take() {
             let channel = self.channel.take().unwrap();
-            if let Err(value) = channel.write(value, Some(cx.waker()), self.finalize) {
+            if let Err(value) =
+                unsafe { channel.to_ref() }.write(value, Some(cx.waker()), self.finalize)
+            {
                 if self.finalize {
                     drop(unsafe { channel.into_box() });
                 }
@@ -383,7 +385,9 @@ impl<T> Future for Flush<'_, T> {
                 Poll::Pending
             }
         } else if let Some(channel) = self.channel.take() {
-            if let Poll::Ready((result, dropped)) = channel.flush(cx.waker(), self.finalize) {
+            if let Poll::Ready((result, dropped)) =
+                unsafe { channel.to_ref() }.flush(cx.waker(), self.finalize)
+            {
                 if dropped && self.finalize {
                     drop(unsafe { channel.into_box() });
                 }
@@ -418,16 +422,18 @@ impl<T> SendOnce<T> {
     /// Check if the receiver has already been dropped.
     #[inline]
     pub fn is_canceled(&self) -> bool {
-        self.channel.is_done()
+        unsafe { self.channel.to_ref() }.is_done()
     }
 
     /// Dispatch the result and consume the [`SendOnce`].
     pub fn send_nowait(self, value: T) -> Result<(), T> {
         let channel = ManuallyDrop::new(self).channel;
-        channel.write(value, None, true).map_err(|value| {
-            drop(unsafe { channel.into_box() });
-            value
-        })
+        unsafe { channel.to_ref() }
+            .write(value, None, true)
+            .map_err(|value| {
+                drop(unsafe { channel.into_box() });
+                value
+            })
     }
 
     /// Load a value to be sent, returning a [`Future`] which resolves when
@@ -445,8 +451,10 @@ impl<T> SendOnce<T> {
 
 impl<T> Drop for SendOnce<T> {
     fn drop(&mut self) {
-        if self.channel.drop_one_side(true) {
-            drop(unsafe { self.channel.into_box() });
+        unsafe {
+            if self.channel.to_ref().drop_one_side(true) {
+                drop(self.channel.into_box());
+            }
         }
     }
 }
@@ -464,7 +472,7 @@ impl<T> ReceiveOnce<T> {
     /// Safely cancel the receive operation, consuming the [`ReceiveOnce`].
     pub fn cancel(self) -> Option<T> {
         ManuallyDrop::new(self).channel.take().and_then(|channel| {
-            if let Poll::Ready((result, dropped)) = channel.read(None, true) {
+            if let Poll::Ready((result, dropped)) = unsafe { channel.to_ref() }.read(None, true) {
                 if dropped {
                     drop(unsafe { channel.into_box() });
                 }
@@ -489,7 +497,7 @@ impl<T> ReceiveOnce<T> {
     /// Block the current thread until a value is received or the [`SendOnce`] is dropped.
     pub fn recv(self) -> Result<T, RecvError> {
         if let Some(channel) = ManuallyDrop::new(self).channel.take() {
-            let (result, dropped) = channel.wait_read();
+            let (result, dropped) = unsafe { channel.to_ref() }.wait_read();
             if dropped {
                 drop(unsafe { channel.into_box() });
             }
@@ -503,7 +511,8 @@ impl<T> ReceiveOnce<T> {
     /// returning `Err(Self)` if a timeout is reached.
     pub fn recv_timeout(&mut self, timeout: impl Expiry) -> Result<T, RecvError> {
         if let Some(channel) = self.channel.take() {
-            let (result, dropped) = channel.wait_read_timeout(timeout.into_opt_instant());
+            let (result, dropped) =
+                unsafe { channel.to_ref() }.wait_read_timeout(timeout.into_opt_instant());
             if dropped {
                 drop(unsafe { channel.into_box() });
                 result.ok_or(RecvError::Incomplete)
@@ -521,7 +530,7 @@ impl<T> ReceiveOnce<T> {
     // poll for the result (internal)
     fn poll_result(&mut self, waker: Option<&Waker>) -> Poll<Result<T, RecvError>> {
         if let Some(channel) = self.channel {
-            if let Poll::Ready((result, dropped)) = channel.read(waker, false) {
+            if let Poll::Ready((result, dropped)) = unsafe { channel.to_ref() }.read(waker, false) {
                 if dropped {
                     self.channel.take();
                     drop(unsafe { channel.into_box() });
@@ -540,7 +549,7 @@ impl<T> ReceiveOnce<T> {
 impl<T> Drop for ReceiveOnce<T> {
     fn drop(&mut self) {
         if let Some(channel) = self.channel.take() {
-            if channel.drop_one_side(false) {
+            if unsafe { channel.to_ref() }.drop_one_side(false) {
                 drop(unsafe { channel.into_box() });
             }
         }
@@ -559,7 +568,10 @@ impl<T> Future for ReceiveOnce<T> {
 impl<T> FusedFuture for ReceiveOnce<T> {
     #[inline]
     fn is_terminated(&self) -> bool {
-        self.channel.as_ref().map(|c| c.is_done()).unwrap_or(true)
+        self.channel
+            .as_ref()
+            .map(|c| unsafe { c.to_ref() }.is_done())
+            .unwrap_or(true)
     }
 }
 
@@ -575,7 +587,10 @@ impl<T> Stream for ReceiveOnce<T> {
 impl<T> FusedStream for ReceiveOnce<T> {
     #[inline]
     fn is_terminated(&self) -> bool {
-        self.channel.as_ref().map(|c| c.is_done()).unwrap_or(true)
+        self.channel
+            .as_ref()
+            .map(|c| unsafe { c.to_ref() }.is_done())
+            .unwrap_or(true)
     }
 }
 
@@ -592,16 +607,20 @@ impl<T> Sender<T> {
     /// Check if the receiver has already been dropped.
     #[inline]
     pub fn is_canceled(&self) -> bool {
-        self.channel.map(|c| c.is_done()).unwrap_or(true)
+        self.channel
+            .map(|c| unsafe { c.to_ref() }.is_done())
+            .unwrap_or(true)
     }
 
     /// Send a single result and consume the [`Sender`].
     pub fn send_nowait(self, value: T) -> Result<(), T> {
         if let Some(channel) = ManuallyDrop::new(self).channel {
-            channel.write(value, None, true).map_err(|value| {
-                drop(unsafe { channel.into_box() });
-                value
-            })
+            unsafe { channel.to_ref() }
+                .write(value, None, true)
+                .map_err(|value| {
+                    drop(unsafe { channel.into_box() });
+                    value
+                })
         } else {
             Err(value)
         }
@@ -623,7 +642,7 @@ impl<T> Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         if let Some(channel) = self.channel.take() {
-            if channel.drop_one_side(true) {
+            if unsafe { channel.to_ref() }.drop_one_side(true) {
                 drop(unsafe { channel.into_box() });
             }
         }
@@ -643,7 +662,7 @@ impl<T> Receiver<T> {
     /// Safely cancel the receive operation, consuming the [`Receiver`].
     pub fn cancel(self) -> Option<T> {
         if let Some(channel) = ManuallyDrop::new(self).channel.take() {
-            if let Poll::Ready((result, dropped)) = channel.read(None, true) {
+            if let Poll::Ready((result, dropped)) = unsafe { channel.to_ref() }.read(None, true) {
                 if dropped {
                     drop(unsafe { channel.into_box() });
                 }
@@ -660,7 +679,7 @@ impl<T> Receiver<T> {
     /// Try to receive the next value from the stream.
     pub fn try_recv(&mut self) -> Poll<Option<T>> {
         if let Some(channel) = self.channel.take() {
-            if let Poll::Ready((result, dropped)) = channel.read(None, false) {
+            if let Poll::Ready((result, dropped)) = unsafe { channel.to_ref() }.read(None, false) {
                 if dropped {
                     drop(unsafe { channel.into_box() });
                 } else {
@@ -680,7 +699,7 @@ impl<T> Receiver<T> {
     /// [`None`] if the sender has been dropped.
     pub fn wait_next(&mut self) -> Option<T> {
         if let Some(channel) = self.channel.take() {
-            let (result, dropped) = channel.wait_read();
+            let (result, dropped) = unsafe { channel.to_ref() }.wait_read();
             if dropped {
                 drop(unsafe { channel.into_box() });
             } else {
@@ -697,7 +716,8 @@ impl<T> Receiver<T> {
     /// provided timeout is reached.
     pub fn wait_next_timeout(&mut self, timeout: impl Expiry) -> Result<T, RecvError> {
         if let Some(channel) = self.channel.take() {
-            let (result, dropped) = channel.wait_read_timeout(timeout.into_opt_instant());
+            let (result, dropped) =
+                unsafe { channel.to_ref() }.wait_read_timeout(timeout.into_opt_instant());
             if dropped {
                 drop(unsafe { channel.into_box() });
                 result.ok_or(RecvError::Incomplete)
@@ -716,7 +736,7 @@ impl<T> Receiver<T> {
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         if let Some(channel) = self.channel.take() {
-            if channel.drop_one_side(false) {
+            if unsafe { channel.to_ref() }.drop_one_side(false) {
                 drop(unsafe { channel.into_box() });
             }
         }
@@ -728,7 +748,7 @@ impl<T> Stream for Receiver<T> {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
         if let Some(channel) = self.channel.clone() {
-            channel
+            unsafe { channel.to_ref() }
                 .read(Some(cx.waker()), false)
                 .map(|(result, dropped)| {
                     if dropped {
@@ -746,7 +766,10 @@ impl<T> Stream for Receiver<T> {
 impl<T> FusedStream for Receiver<T> {
     #[inline]
     fn is_terminated(&self) -> bool {
-        self.channel.as_ref().map(|c| c.is_done()).unwrap_or(true)
+        self.channel
+            .as_ref()
+            .map(|c| unsafe { c.to_ref() }.is_done())
+            .unwrap_or(true)
     }
 }
 

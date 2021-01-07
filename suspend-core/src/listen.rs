@@ -115,7 +115,7 @@ impl Listener {
     /// already been locked.
     #[inline]
     pub fn lock(&self) -> Result<ListenerGuard<'_>, LockError> {
-        self.inner.parker.acquire()?;
+        unsafe { self.inner.to_ref() }.parker.acquire()?;
         Ok(ListenerGuard::new(self.inner, true))
     }
 
@@ -131,13 +131,13 @@ impl Listener {
     /// state was not already set to notified.
     #[inline]
     pub fn notify(&self) -> bool {
-        self.inner.notify()
+        unsafe { self.inner.to_ref() }.notify()
     }
 
     /// Create a new [`Notifier`] instance associated with this `Listener`.
     #[inline]
     pub fn notifier(&self) -> Notifier {
-        self.inner.inc_count();
+        unsafe { self.inner.to_ref() }.inc_count();
         Notifier { inner: self.inner }
     }
 
@@ -191,8 +191,8 @@ impl ListenInner {
     #[inline]
     pub fn waker(inner: BoxPtr<Self>) -> Waker {
         unsafe {
-            inner.inc_count();
-            Waker::from_raw(Self::raw_waker(inner.as_ptr()))
+            inner.to_ref().inc_count();
+            Waker::from_raw(Self::raw_waker(inner.to_ptr()))
         }
     }
 
@@ -203,19 +203,18 @@ impl ListenInner {
 
     unsafe fn waker_clone(data: *const ()) -> RawWaker {
         let inner = BoxPtr::from_ptr(data as *const Self);
-        inner.inc_count();
-        Self::raw_waker(inner.as_ptr())
+        inner.to_ref().inc_count();
+        Self::raw_waker(inner.to_ptr())
     }
 
     unsafe fn waker_wake(data: *const ()) {
         let inner = BoxPtr::from_ptr(data as *const Self);
-        inner.notify();
+        inner.to_ref().notify();
         Self::dec_count_drop(inner);
     }
 
     unsafe fn waker_wake_by_ref(data: *const ()) {
-        let inner = BoxPtr::from_ptr(data as *const Self);
-        inner.notify();
+        (&*(data as *const Self)).notify();
     }
 
     unsafe fn waker_drop(data: *const ()) {
@@ -242,7 +241,7 @@ impl ListenInner {
 
     #[inline]
     pub fn dec_count_drop(inner: BoxPtr<Self>) {
-        if inner.dec_count() == 0 {
+        if unsafe { inner.to_ref() }.dec_count() == 0 {
             drop(unsafe { inner.into_box() })
         }
     }
@@ -273,7 +272,7 @@ impl<'g> ListenerGuard<'g> {
     /// Create a [`Notifier`] associated with the [`Listener`] instance.
     #[inline]
     pub fn notifier(&self) -> Notifier {
-        self.inner.inc_count();
+        unsafe { self.inner.to_ref() }.inc_count();
         Notifier { inner: self.inner }
     }
 
@@ -291,14 +290,16 @@ impl<'g> ListenerGuard<'g> {
     /// return immediately. The return value indicates whether a notification was
     /// consumed, returning `false` in the case of a timeout.
     pub fn wait(&mut self, timeout: impl Expiry) -> Result<bool, LockError> {
-        self.inner.parker.park(timeout.into_opt_instant())
+        unsafe { self.inner.to_ref() }
+            .parker
+            .park(timeout.into_opt_instant())
     }
 }
 
 impl Drop for ListenerGuard<'_> {
     fn drop(&mut self) {
         if self.release {
-            self.inner.parker.release().unwrap();
+            unsafe { self.inner.to_ref() }.parker.release().unwrap();
         }
     }
 }
@@ -311,7 +312,7 @@ pub struct Notifier {
 
 impl Clone for Notifier {
     fn clone(&self) -> Self {
-        self.inner.inc_count();
+        unsafe { self.inner.to_ref() }.inc_count();
         Self { inner: self.inner }
     }
 }
@@ -321,7 +322,7 @@ impl Notifier {
     /// the state was not already set to notified.
     #[inline]
     pub fn notify(&self) -> bool {
-        self.inner.notify()
+        unsafe { self.inner.to_ref() }.notify()
     }
 }
 

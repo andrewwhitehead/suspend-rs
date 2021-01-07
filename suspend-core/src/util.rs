@@ -4,7 +4,6 @@ use core::{
     cell::Cell,
     fmt::{self, Debug, Formatter},
     marker::PhantomData,
-    ops::Deref,
     ptr::NonNull,
 };
 
@@ -38,8 +37,14 @@ impl<T: ?Sized> BoxPtr<T> {
     }
 
     /// Convert a `BoxPtr<T>` to a shared `T` pointer
-    pub const fn as_ptr(&self) -> *const T {
+    pub const fn to_ptr(self) -> *const T {
         self.0.as_ptr()
+    }
+
+    /// Convert a `BoxPtr<T>` to a shared `T` pointer
+    #[inline]
+    pub unsafe fn to_ref<'r>(self) -> &'r T {
+        &*self.0.as_ptr()
     }
 
     /// Convert a shared `T` pointer to a `BoxPtr<T>`
@@ -53,27 +58,20 @@ impl<T: ?Sized> BoxPtr<T> {
 
     /// Unwrap the `Box<T>` pointed to by this `BoxPtr<T>`. The caller is responsible
     /// for ensuring that no additional references exist
+    #[inline]
     pub unsafe fn into_box(self) -> Box<T> {
         Box::from_raw(self.0.as_ptr())
     }
 }
 
 impl<T: ?Sized> Clone for BoxPtr<T> {
+    #[inline]
     fn clone(&self) -> Self {
         Self(self.0, PhantomData)
     }
 }
 
 impl<T: ?Sized> Copy for BoxPtr<T> {}
-
-impl<T: ?Sized> Deref for BoxPtr<T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        unsafe { self.0.as_ref() }
-    }
-}
 
 impl<T: Debug + ?Sized> Debug for BoxPtr<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {

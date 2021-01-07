@@ -75,17 +75,17 @@ impl<T> Shared<T> {
     /// Get the current number of borrows
     #[inline]
     pub fn borrow_count(&self) -> usize {
-        self.inner.borrow_count()
+        unsafe { self.inner.to_ref() }.borrow_count()
     }
 
     /// Wait for all outstanding borrows to be dropped, with an optional expiry
     pub fn collect(&mut self, timeout: impl Expiry) -> Result<bool, LockError> {
-        self.inner.collect(timeout.into_opt_instant())
+        unsafe { self.inner.to_ref() }.collect(timeout.into_opt_instant())
     }
 
     /// Wait for all outstanding borrows to be dropped and unwrap the `Shared<T>`
     pub fn collect_into(self) -> Result<T, LockError> {
-        self.inner.collect(None)?;
+        unsafe { self.inner.to_ref() }.collect(None)?;
         let inner = ManuallyDrop::new(self).inner;
         Ok(unsafe { inner.into_box().into_inner() })
     }
@@ -96,7 +96,7 @@ impl<T: ?Sized> Deref for Shared<T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        &self.inner.value
+        &unsafe { self.inner.to_ref() }.value
     }
 }
 
@@ -146,7 +146,7 @@ impl<T: ?Sized> SharedInner<T> {
 
     #[inline]
     pub unsafe fn drop_shared(slf: BoxPtr<Self>) {
-        if slf.count.fetch_sub(3, Ordering::Release) == 3 {
+        if slf.to_ref().count.fetch_sub(3, Ordering::Release) == 3 {
             fence(Ordering::Acquire);
             drop(slf.into_box())
         }
@@ -270,14 +270,14 @@ unsafe impl<T: ?Sized + Send> Send for SharedRef<T> {}
 impl<T: ?Sized> SharedRef<T> {
     #[inline]
     pub(crate) fn new(inner: BoxPtr<SharedInner<T>>) -> Self {
-        unsafe { SharedInner::inc_count_ref(inner.as_ptr()) };
+        unsafe { SharedInner::inc_count_ref(inner.to_ptr()) };
         SharedRef { inner }
     }
 
     /// Get the current number of borrows, including this one
     #[inline]
     pub fn borrow_count(&self) -> usize {
-        self.inner.borrow_count()
+        unsafe { self.inner.to_ref() }.borrow_count()
     }
 
     /// Create a temporary reference without increasing the borrow count
@@ -300,7 +300,7 @@ impl<T: ?Sized> Deref for SharedRef<T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        &self.inner.value
+        &unsafe { self.inner.to_ref() }.value
     }
 }
 
@@ -308,7 +308,7 @@ impl<T: ?Sized> Drop for SharedRef<T> {
     #[inline]
     fn drop(&mut self) {
         unsafe {
-            if SharedInner::dec_count_ref(self.inner.as_ptr()) {
+            if SharedInner::dec_count_ref(self.inner.to_ptr()) {
                 info!("drop shared ref");
                 drop(self.inner.into_box())
             }
@@ -330,7 +330,7 @@ impl<T: ?Sized> Ref<'_, T> {
     /// Get the current number of borrows, including this one
     #[inline]
     pub fn borrow_count(&self) -> usize {
-        self.inner.borrow_count()
+        unsafe { self.inner.to_ref() }.borrow_count()
     }
 
     /// Construct a new `SharedRef<T>` for the associated `Shared<T>`
@@ -355,7 +355,7 @@ impl<T: ?Sized> Deref for Ref<'_, T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        &self.inner.value
+        &unsafe { self.inner.to_ref() }.value
     }
 }
 
