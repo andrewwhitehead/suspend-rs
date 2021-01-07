@@ -2,12 +2,17 @@ use std::{
     fmt::{self, Debug, Formatter},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Condvar, Mutex, PoisonError,
+        Condvar, Mutex, MutexGuard, PoisonError, TryLockError,
     },
     time::Instant,
 };
 
-use super::{LockError, RawLock};
+use super::{HasGuard, LockError, RawGuard, RawInit, RawLock, RawParker};
+
+const STATE_FREE: usize = 0b0000;
+const STATE_HELD: usize = 0b0010;
+const STATE_PARK: usize = 0b0100;
+const STATE_UNPARK: usize = 0b1000;
 
 impl<T> From<PoisonError<T>> for LockError {
     fn from(_: PoisonError<T>) -> Self {
@@ -15,18 +20,100 @@ impl<T> From<PoisonError<T>> for LockError {
     }
 }
 
-const STATE_FREE: usize = 0b0000;
-const STATE_HELD: usize = 0b0001;
-const STATE_PARK: usize = 0b0010;
-const STATE_NOTIFY: usize = 0b0100;
-
 pub struct LockImpl {
+    cond: Condvar,
+    mutex: Mutex<()>,
+}
+
+impl RawInit for LockImpl {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            cond: Condvar::new(),
+            mutex: Mutex::new(()),
+        }
+    }
+}
+
+impl RawLock for LockImpl {
+    #[inline]
+    fn lock(&self) -> Result<GuardImpl<'_>, LockError> {
+        let guard = self.mutex.lock()?;
+        Ok(GuardImpl {
+            guard,
+            cond: &self.cond,
+        })
+    }
+
+    #[inline]
+    fn try_lock(&self) -> Result<<Self as HasGuard<'_>>::Guard, LockError> {
+        match self.mutex.try_lock() {
+            Ok(guard) => Ok(GuardImpl {
+                guard,
+                cond: &self.cond,
+            }),
+            Err(TryLockError::Poisoned(..)) => Err(LockError::Poisoned),
+            Err(TryLockError::WouldBlock) => Err(LockError::Contended),
+        }
+    }
+
+    #[inline]
+    fn notify(&self) {
+        self.cond.notify_one();
+    }
+}
+
+impl Debug for LockImpl {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("default::LockImpl").finish()
+    }
+}
+
+impl<'g> HasGuard<'g> for LockImpl {
+    type Guard = GuardImpl<'g>;
+}
+
+#[derive(Debug)]
+pub struct GuardImpl<'g> {
+    guard: MutexGuard<'g, ()>,
+    cond: &'g Condvar,
+}
+
+impl<'g> RawGuard<'g> for GuardImpl<'g> {
+    fn wait(self, timeout: Option<Instant>) -> Result<(Self, bool), LockError> {
+        if let Some(exp) = timeout {
+            if let Some(dur) = exp.checked_duration_since(Instant::now()) {
+                let (guard, timeout_result) = self.cond.wait_timeout(self.guard, dur)?;
+                Ok((
+                    Self {
+                        guard,
+                        cond: self.cond,
+                    },
+                    timeout_result.timed_out(),
+                ))
+            } else {
+                Ok((self, true))
+            }
+        } else {
+            let guard = self.cond.wait(self.guard)?;
+            Ok((
+                Self {
+                    guard,
+                    cond: self.cond,
+                },
+                false,
+            ))
+        }
+    }
+}
+
+pub struct ParkImpl {
     cond: Condvar,
     mutex: Mutex<()>,
     state: AtomicUsize,
 }
 
-impl RawLock for LockImpl {
+impl RawInit for ParkImpl {
     #[inline]
     fn new() -> Self {
         Self {
@@ -35,7 +122,9 @@ impl RawLock for LockImpl {
             state: AtomicUsize::new(STATE_FREE),
         }
     }
+}
 
+impl RawParker for ParkImpl {
     #[inline]
     fn acquire(&self) -> Result<(), LockError> {
         if self.state.fetch_or(STATE_HELD, Ordering::Acquire) & STATE_HELD == 0 {
@@ -55,25 +144,28 @@ impl RawLock for LockImpl {
     fn park(&self, timeout: Option<Instant>) -> Result<bool, LockError> {
         // relaxed ordering is suffient, we will check again after acquiring the mutex
         let state = self.state.load(Ordering::Relaxed);
-        if state & STATE_NOTIFY != 0 {
+        if state & STATE_UNPARK != 0 {
             // consume notification
-            let found = self.state.swap(state & !STATE_NOTIFY, Ordering::Acquire);
+            let found = self.state.swap(state & !STATE_UNPARK, Ordering::Acquire);
             debug_assert_eq!(found, state);
             return Ok(true);
         }
 
-        let mut mlock = self.mutex.lock()?;
+        let mut guard = GuardImpl {
+            guard: self.mutex.lock()?,
+            cond: &self.cond,
+        };
 
         match self.state.compare_exchange(
             state,
             state | STATE_PARK,
             Ordering::Acquire,
-            Ordering::Relaxed,
+            Ordering::Acquire,
         ) {
             Ok(_) => (),
-            Err(state) if state & STATE_NOTIFY != 0 => {
-                drop(mlock);
-                let found = self.state.swap(state & !STATE_NOTIFY, Ordering::Acquire);
+            Err(state) if state & STATE_UNPARK != 0 => {
+                drop(guard);
+                let found = self.state.swap(state & !STATE_UNPARK, Ordering::Acquire);
                 debug_assert_eq!(found, state);
                 return Ok(true);
             }
@@ -81,39 +173,23 @@ impl RawLock for LockImpl {
         }
 
         loop {
-            let timeout_state = if let Some(exp) = timeout {
-                if let Some(dur) = exp.checked_duration_since(Instant::now()) {
-                    let (ml, timeout_result) = self.cond.wait_timeout(mlock, dur)?;
-                    mlock = ml;
-                    Some(timeout_result.timed_out())
-                } else {
-                    Some(true)
-                }
-            } else {
-                None
-            };
+            let (g, timed_out) = guard.wait(timeout)?;
+            guard = g;
 
-            let timed_out = if let Some(t) = timeout_state {
-                t
-            } else {
-                mlock = self.cond.wait(mlock)?;
-                false
-            };
-
-            let state = self.state.load(Ordering::Relaxed);
-            if timed_out || state & STATE_NOTIFY != 0 {
+            let state = self.state.load(Ordering::Acquire);
+            if timed_out || state & STATE_UNPARK != 0 {
                 let found = self
                     .state
-                    .swap(state & !(STATE_PARK | STATE_NOTIFY), Ordering::Acquire);
-                drop(mlock);
-                return Ok(found & STATE_NOTIFY != 0);
+                    .swap(state & !(STATE_PARK | STATE_UNPARK), Ordering::Acquire);
+                drop(guard);
+                return Ok(found & STATE_UNPARK != 0);
             }
         }
     }
 
-    fn notify(&self) -> bool {
-        let found = self.state.fetch_or(STATE_NOTIFY, Ordering::Release);
-        if found & STATE_NOTIFY == 0 {
+    fn unpark(&self) -> bool {
+        let found = self.state.fetch_or(STATE_UNPARK, Ordering::Release);
+        if found & STATE_UNPARK == 0 {
             if found & STATE_PARK != 0 {
                 // acquire the mutex because the parking thread could be interrupted
                 // between setting the state and waiting on the condvar
@@ -128,8 +204,8 @@ impl RawLock for LockImpl {
     }
 }
 
-impl Debug for LockImpl {
+impl Debug for ParkImpl {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("default::LockImpl").finish()
+        f.debug_struct("default::ParkImpl").finish()
     }
 }
