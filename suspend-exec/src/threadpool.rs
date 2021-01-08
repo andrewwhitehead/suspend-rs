@@ -1,19 +1,12 @@
 use core::{
     any::Any,
-    future::Future,
     mem,
-    pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
-    task::{Context, Poll},
     time::Duration,
 };
 use std::{collections::VecDeque, marker::PhantomData, panic, thread};
 
-use suspend_channel::{
-    send_once,
-    task::{task_fn, JoinTask, TaskFn, TaskResult},
-    ReceiveOnce, RecvError,
-};
+use suspend_channel::task::{task_fn, JoinTask, TaskFn, TaskResult};
 use suspend_core::{
     lock::{Lock, LockGuard},
     shared::{PinShared, Ref, ScopedRef, Shared, SharedRef},
