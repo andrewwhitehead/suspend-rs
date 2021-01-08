@@ -247,7 +247,7 @@ impl RawParker for ParkImpl {
         if state & STATE_UNPARK != 0 {
             guard.unlock()?;
             let found = self.state.swap(state & !STATE_UNPARK, Ordering::Acquire);
-            debug_assert_eq!(found, state);
+            debug_assert_eq!(found | (STATE_INIT | STATE_PARK), state);
             return Ok(true);
         }
 
@@ -261,7 +261,6 @@ impl RawParker for ParkImpl {
                     .state
                     .swap(state & !(STATE_PARK | STATE_UNPARK), Ordering::Acquire);
                 guard.unlock()?;
-
                 return Ok(found & STATE_UNPARK != 0);
             }
         }
