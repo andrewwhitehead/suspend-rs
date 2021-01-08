@@ -40,5 +40,5 @@ name = "shared"
 harness = false
 
 [[bench]]
-name = "thread_pool"
+name = "threadpool"
 harness = false
