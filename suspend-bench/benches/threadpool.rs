@@ -3,7 +3,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use blocking;
 use once_cell::sync::Lazy;
 use suspend_core::listen::block_on;
-use suspend_exec::{ThreadPool, ThreadPoolConfig};
+use suspend_exec::ThreadPool;
 
 #[cfg(target = "macos")]
 #[global_allocator]
