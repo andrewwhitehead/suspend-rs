@@ -79,6 +79,21 @@ impl<T> Channel<T> {
             panic!("Invalid send to loaded channel");
         }
         unsafe { self.value.store(value) };
+        // fast path for no wakers
+        if waker.is_none()
+            && state & STATE_WAKE == 0
+            && self
+                .state
+                .compare_exchange_weak(
+                    state,
+                    (state | STATE_LOADED) & !(finalize as u8),
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            return Ok(());
+        }
         // release - sync update to the store, above. acquire - sync update to the waker, below.
         let mut prev = self
             .state
@@ -98,10 +113,7 @@ impl<T> Channel<T> {
                     return Err(unsafe { self.value.load() });
                 }
             } else {
-                let mut remove = STATE_WLOCK | STATE_WAKE;
-                if finalize {
-                    remove |= STATE_ACTIVE;
-                }
+                let remove = STATE_WLOCK | STATE_WAKE | (finalize as u8 * STATE_ACTIVE);
                 prev = self.state.fetch_and(!remove, Ordering::Release);
                 if prev & STATE_ACTIVE == 0 {
                     return Err(unsafe { self.value.load() });
@@ -126,10 +138,7 @@ impl<T> Channel<T> {
             if prev & STATE_LOADED == 0 {
                 if locked {
                     // reset state
-                    let mut remove = STATE_WLOCK | STATE_WAKE;
-                    if finalize {
-                        remove |= STATE_ACTIVE;
-                    }
+                    let remove = STATE_WLOCK | STATE_WAKE | (finalize as u8 * STATE_ACTIVE);
                     self.state.fetch_and(!remove, Ordering::Relaxed);
                 } else {
                     // using acquire to sync with the read
@@ -201,7 +210,6 @@ impl<T> Channel<T> {
             };
             if locked {
                 prev = self.state.fetch_and(
-                    // if finalize { STATE_DONE } else { STATE_ACTIVE },
                     !(STATE_LOADED | STATE_WLOCK | STATE_WAKE | STATE_RLOCK),
                     Ordering::Release,
                 );
@@ -234,10 +242,8 @@ impl<T> Channel<T> {
                         unsafe { self.waker.clear() };
                     }
                 } else {
-                    let mut remove = STATE_RLOCK | STATE_WLOCK | STATE_WAKE;
-                    if or_cancel {
-                        remove |= STATE_ACTIVE;
-                    }
+                    let remove =
+                        STATE_RLOCK | STATE_WLOCK | STATE_WAKE | (or_cancel as u8 * STATE_ACTIVE);
                     prev = self.state.fetch_and(!remove, Ordering::Release);
                 }
             }
@@ -323,7 +329,7 @@ impl<T> Channel<T> {
             Poll::Ready(result) => result,
             Poll::Pending => {
                 // cancel read - return value if any was stored
-                if let Poll::Ready(r) = self.read(None, true) {
+                if let Poll::Ready(r) = self.read(None, false) {
                     r
                 } else {
                     (None, false)
