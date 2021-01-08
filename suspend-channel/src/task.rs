@@ -1,15 +1,21 @@
+//! Wrap a function and a channel in a single heap allocation, allowing
+//! for async polling of the result.
+
 use core::{
     cell::UnsafeCell,
     future::Future,
     marker::PhantomData,
-    mem::{forget, transmute},
+    mem::{forget, transmute, ManuallyDrop},
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll},
 };
 
+use suspend_core::Expiry;
+
 use crate::{channel::Channel, RecvError};
 
+/// The result type for a `JoinTask<'t, T>`
 pub type TaskResult<T> = Result<T, RecvError>;
 
 struct TaskVTable {
@@ -94,6 +100,7 @@ impl<T> Drop for TaskGuard<T> {
     }
 }
 
+/// The result of a spawned `TaskFn` which can be polled or joined
 #[derive(Debug)]
 pub struct JoinTask<'t, T> {
     task: Option<NonNull<TaskHeader<T>>>,
@@ -101,8 +108,9 @@ pub struct JoinTask<'t, T> {
 }
 
 impl<'t, T> JoinTask<'t, T> {
-    pub fn join(mut self) -> TaskResult<T> {
-        if let Some(task) = self.task.take() {
+    /// Block the current thread on the result of the task
+    pub fn join(self) -> TaskResult<T> {
+        if let Some(task) = ManuallyDrop::new(self).task {
             let (result, dropped) = unsafe { &*task.as_ptr() }.channel.wait_read();
             if dropped {
                 unsafe { ((&*task.as_ptr()).vtable.drop)(task.as_ptr() as *const ()) };
@@ -113,7 +121,25 @@ impl<'t, T> JoinTask<'t, T> {
         }
     }
 
-    // TODO: add join_timeout
+    /// Block the current thread on the result of the task, with a timeout
+    pub fn join_timeout(&mut self, timeout: impl Expiry) -> TaskResult<T> {
+        if let Some(task) = self.task.take() {
+            let (result, dropped) = unsafe { &*task.as_ptr() }
+                .channel
+                .wait_read_timeout(timeout.into_opt_instant());
+            if dropped {
+                unsafe { ((&*task.as_ptr()).vtable.drop)(task.as_ptr() as *const ()) };
+                result.ok_or(RecvError::Incomplete)
+            } else if let Some(result) = result {
+                Ok(result)
+            } else {
+                self.task.replace(task);
+                Err(RecvError::TimedOut)
+            }
+        } else {
+            Err(RecvError::Terminated)
+        }
+    }
 }
 
 impl<'t, T> Future for JoinTask<'t, T> {
@@ -152,6 +178,7 @@ impl<T> Drop for JoinTask<'_, T> {
 
 impl<T> Unpin for JoinTask<'_, T> {}
 
+/// A handle for a heap-allocated task
 #[derive(Debug)]
 pub struct TaskFn<'t> {
     task: NonNull<TaskVTable>,
@@ -161,6 +188,8 @@ pub struct TaskFn<'t> {
 unsafe impl Send for TaskFn<'_> {}
 
 impl TaskFn<'_> {
+    /// Execute the task. Panics are propagated to the caller of this method,
+    /// and the paired `JoinTask` will receive `Err(RecvError::Incomplete)`.
     #[inline]
     pub fn run(self) {
         let addr = self.task.as_ptr();
@@ -178,6 +207,7 @@ impl Drop for TaskFn<'_> {
     }
 }
 
+/// Create a new pair of a `TaskFn` and `JoinTask` from a coroutine
 pub fn task_fn<'t, T: 't>(f: impl FnOnce() -> T + Send + 't) -> (TaskFn<'t>, JoinTask<'t, T>) {
     let inner = TaskInner::new_fn(f);
     let task = TaskFn {
@@ -189,45 +219,4 @@ pub fn task_fn<'t, T: 't>(f: impl FnOnce() -> T + Send + 't) -> (TaskFn<'t>, Joi
         _marker: PhantomData,
     };
     (task, join)
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::RecvError;
-    use suspend_core::listen::block_on;
-
-    use super::task_fn;
-
-    #[test]
-    fn task_fn_basic() {
-        let (task, join) = task_fn(|| true);
-        task.run();
-        assert_eq!(join.join(), Ok(true));
-    }
-
-    #[test]
-    fn task_fn_drop() {
-        let (task, join) = task_fn(|| true);
-        drop(task);
-        assert_eq!(join.join(), Err(RecvError::Incomplete));
-    }
-
-    #[test]
-    fn task_fn_join_drop() {
-        let (task, join) = task_fn(|| true);
-        drop(join);
-        task.run();
-    }
-
-    #[test]
-    fn task_fn_join_block_on() {
-        let (task, join) = task_fn(|| true);
-        task.run();
-        assert_eq!(block_on(join), Ok(true));
-    }
-
-    #[test]
-    fn task_fn_both_drop() {
-        task_fn(|| true);
-    }
 }

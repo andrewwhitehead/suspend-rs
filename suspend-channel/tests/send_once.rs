@@ -6,6 +6,7 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 use std::thread;
+use std::time::Duration;
 
 use futures_core::FusedFuture;
 use futures_task::{waker_ref, ArcWake};
@@ -82,6 +83,21 @@ fn send_once_receive_wait() {
     let (sender, receiver) = send_once();
     assert_eq!(sender.send_nowait(1u32), Ok(()));
     assert_eq!(receiver.recv(), Ok(1u32));
+}
+
+#[test]
+fn send_once_receive_wait_timeout() {
+    let (sender, mut receiver) = send_once();
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_millis(50)),
+        Err(RecvError::TimedOut)
+    );
+    assert_eq!(sender.send_nowait(1u32), Ok(()));
+    assert_eq!(receiver.recv_timeout(Duration::from_millis(50)), Ok(1u32));
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_millis(50)),
+        Err(RecvError::Terminated)
+    );
 }
 
 #[test]
