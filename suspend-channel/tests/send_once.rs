@@ -189,7 +189,7 @@ fn send_once_receiver_cancel_late() {
 }
 
 #[test]
-fn send_once_flush() {
+fn send_once_flush_waker_test() {
     let (sender, receiver) = send_once();
     let (message, drops) = TestDrop::new_pair();
     let waker = Arc::new(TestWaker::new());

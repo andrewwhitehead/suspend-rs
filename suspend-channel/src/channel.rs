@@ -121,12 +121,12 @@ impl<T> Channel<T> {
             }
             recv_waker.map(Waker::wake);
         } else {
-            // receiver locked the waker. it will see STATE_LOADED when it unlocks
+            // reader locked the waker. it will see STATE_LOADED when it unlocks
             // and take the value immediately. call our waker to proceed to flush()
             if let Some(waker) = waker {
                 waker.wake_by_ref();
             }
-            // note: receiver will also reset the WAKE flag appropriately
+            // note: reader will also reset the WAKE flag appropriately
         }
         Ok(())
     }
@@ -141,7 +141,7 @@ impl<T> Channel<T> {
                     let remove = STATE_WLOCK | STATE_WAKE | (finalize as u8 * STATE_ACTIVE);
                     self.state.fetch_and(!remove, Ordering::Relaxed);
                 } else {
-                    // using acquire to sync with the read
+                    // using acquire ordering to sync with the read
                     prev = if finalize {
                         self.state.fetch_and(!STATE_ACTIVE, Ordering::Acquire)
                     } else {
@@ -151,7 +151,7 @@ impl<T> Channel<T> {
                 return Poll::Ready((None, prev & STATE_ACTIVE == 0));
             }
             if prev & STATE_ACTIVE == 0 {
-                // receiver dropped, leaving value. there must not be a waker
+                // writer dropped, leaving value. there must not be a waker
                 if !finalize {
                     // clear LOADED flag for when the writer drops
                     self.state.store(STATE_DONE, Ordering::Relaxed);
@@ -166,7 +166,7 @@ impl<T> Channel<T> {
             }
             if locked {
                 if prev & STATE_WAKE != 0 {
-                    // take previous send waker
+                    // take previous writer waker
                     unsafe { self.waker.clear() };
                 }
                 unsafe { self.waker.store(waker.clone()) };
@@ -214,7 +214,7 @@ impl<T> Channel<T> {
                     Ordering::Release,
                 );
             } else {
-                // leave WLOCK and WAKE for the sender to control
+                // leave WLOCK and WAKE for the writer to control
                 prev = self
                     .state
                     .fetch_and(!(STATE_RLOCK | STATE_LOADED), Ordering::Release);
@@ -248,10 +248,10 @@ impl<T> Channel<T> {
                 }
             }
             if prev & STATE_LOADED != 0 {
-                // sender loaded a value while we were locked - retry
+                // writer loaded a value while we were locked - retry
                 self.read(None, or_cancel)
             } else if prev & STATE_ACTIVE == 0 {
-                // sender dropped
+                // writer dropped
                 Poll::Ready((None, true))
             } else {
                 Poll::Pending
@@ -539,7 +539,8 @@ impl<T> ReceiveOnce<T> {
     fn poll_result(&mut self, waker: Option<&Waker>) -> Poll<Result<T, RecvError>> {
         if let Some(channel) = self.channel.take() {
             if let Poll::Ready((result, dropped)) = unsafe { channel.to_ref() }.read(waker, false) {
-                if dropped {
+                // FIXME - automatically close channel via successful read()
+                if dropped || unsafe { channel.to_ref().drop_one_side(false) } {
                     unsafe { channel.dealloc() };
                 }
                 Poll::Ready(result.ok_or(RecvError::Incomplete))

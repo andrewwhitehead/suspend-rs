@@ -3,6 +3,10 @@ use std::time::Duration;
 use suspend_channel::{task::task_fn, RecvError};
 use suspend_core::listen::block_on;
 
+use self::utils::TestDrop;
+
+mod utils;
+
 #[test]
 fn task_fn_basic() {
     let (task, join) = task_fn(|| true);
@@ -12,9 +16,16 @@ fn task_fn_basic() {
 
 #[test]
 fn task_fn_drop() {
-    let (task, join) = task_fn(|| true);
+    let (track, drops) = TestDrop::new_pair();
+    let (task, join) = task_fn(|| {
+        drop(track);
+        true
+    });
+    assert_eq!(drops.count(), 0);
     drop(task);
+    assert_eq!(drops.count(), 1);
     assert_eq!(join.join(), Err(RecvError::Incomplete));
+    assert_eq!(drops.count(), 1);
 }
 
 #[test]
