@@ -243,11 +243,13 @@ impl RawParker for ParkImpl {
         // relaxed is okay here because unpark will acquire the mutex before notifying
         state = self
             .state
-            .fetch_or(STATE_INIT | STATE_PARK, Ordering::Relaxed);
+            .fetch_or(STATE_INIT | STATE_PARK, Ordering::Relaxed)
+            | STATE_INIT
+            | STATE_PARK;
         if state & STATE_UNPARK != 0 {
             guard.unlock()?;
             let found = self.state.swap(state & !STATE_UNPARK, Ordering::Acquire);
-            debug_assert_eq!(found | (STATE_INIT | STATE_PARK), state);
+            debug_assert_eq!(found, state);
             return Ok(true);
         }
 
