@@ -62,6 +62,7 @@ impl<T> Lock<T> {
     }
 }
 
+unsafe impl<T: Send> Send for Lock<T> {}
 unsafe impl<T: Send> Sync for Lock<T> {}
 
 impl<T: Default> Default for Lock<T> {
