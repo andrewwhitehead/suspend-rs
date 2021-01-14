@@ -1,4 +1,4 @@
-pub use self::threadpool::{ThreadPool, ThreadPoolConfig};
+pub use self::threadpool::{Scope, ThreadPool, ThreadPoolConfig};
 
 pub use suspend_channel::RecvError;
 
