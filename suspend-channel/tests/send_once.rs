@@ -11,7 +11,7 @@ use std::time::Duration;
 use futures_core::FusedFuture;
 use futures_task::{waker_ref, ArcWake};
 
-use suspend_channel::{send_once, RecvError, StreamNext};
+use suspend_channel::{send_once, RecvError, StreamIterExt};
 use suspend_core::listen::block_on;
 
 mod utils;
@@ -159,9 +159,9 @@ fn send_once_receiver_stream_one() {
     let (sender, mut receiver) = send_once::<u32>();
     sender.send_nowait(5).unwrap();
     assert_eq!(receiver.is_terminated(), false);
-    assert_eq!(block_on(receiver.next()), Some(5));
+    assert_eq!(block_on(receiver.stream_next()), Some(5));
     assert_eq!(receiver.is_terminated(), true);
-    assert_eq!(block_on(receiver.next()), None);
+    assert_eq!(block_on(receiver.stream_next()), None);
     assert_eq!(receiver.is_terminated(), true);
 }
 
@@ -170,7 +170,7 @@ fn send_once_receiver_stream_empty() {
     let (sender, mut receiver) = send_once::<u32>();
     drop(sender);
     assert_eq!(receiver.is_terminated(), true);
-    assert_eq!(block_on(receiver.next()), None);
+    assert_eq!(block_on(receiver.stream_next()), None);
     assert_eq!(receiver.is_terminated(), true);
 }
 

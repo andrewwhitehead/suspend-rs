@@ -35,7 +35,7 @@ pub fn send_once<T>() -> (SendOnce<T>, ReceiveOnce<T>) {
 }
 
 /// Create a channel for sending multiple values between a producer and consumer,
-/// with synchronization between each consecutive result.
+/// with synchronization between consecutive results.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let channel = BoxPtr::new(Box::new(Channel::new()));
     (

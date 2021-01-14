@@ -1,12 +1,10 @@
-#![cfg(not(miri))] // not currently supported
-
-use futures_core::FusedStream;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 
-use suspend_channel::{make_stream, stream, try_stream, StreamNext};
+use futures_core::FusedStream;
+use suspend_channel::{async_stream::make_stream, stream, try_stream, StreamIterExt};
 use suspend_core::{listen::block_on, pin};
 
 #[test]
@@ -17,11 +15,12 @@ fn non_macro() {
         sender.send(3u32).await;
     });
     pin!(s);
-    assert_eq!(block_on(s.next()), Some(1));
-    assert_eq!(block_on(s.next()), Some(2));
-    assert_eq!(block_on(s.next()), Some(3));
-    assert_eq!(block_on(s.next()), None);
-    assert_eq!(block_on(s.next()), None);
+    let mut s = s.into_iter();
+    assert_eq!(s.next(), Some(1));
+    assert_eq!(s.next(), Some(2));
+    assert_eq!(s.next(), Some(3));
+    assert_eq!(s.next(), None);
+    assert_eq!(s.next(), None);
 }
 
 #[test]
@@ -32,11 +31,12 @@ fn basic_stream() {
         send!(3);
     };
     pin!(s);
-    assert_eq!(block_on(s.next()), Some(1));
-    assert_eq!(block_on(s.next()), Some(2));
-    assert_eq!(block_on(s.next()), Some(3));
-    assert_eq!(block_on(s.next()), None);
-    assert_eq!(block_on(s.next()), None);
+    let mut s = s.into_iter();
+    assert_eq!(s.next(), Some(1));
+    assert_eq!(s.next(), Some(2));
+    assert_eq!(s.next(), Some(3));
+    assert_eq!(s.next(), None);
+    assert_eq!(s.next(), None);
 }
 
 #[test]
@@ -48,11 +48,12 @@ fn empty_stream() {
             *r = true;
         };
         pin!(s);
-        assert_eq!(block_on(s.next()), Option::<i32>::None);
+        assert_eq!(block_on(s.stream_next()), Option::<i32>::None);
     }
     assert!(ran);
 }
 
+// #[cfg(not(miri))]
 #[test]
 fn nest_stream() {
     let s = stream! {
@@ -61,17 +62,18 @@ fn nest_stream() {
             send!(2);
         };
         pin!(s2);
-        while let Some(item) = s2.next().await {
+        while let Some(item) = s2.stream_next().await {
             send!(item);
         }
         send!(3);
     };
     pin!(s);
-    assert_eq!(block_on(s.next()), Some(1));
-    assert_eq!(block_on(s.next()), Some(2));
-    assert_eq!(block_on(s.next()), Some(3));
-    assert_eq!(block_on(s.next()), None);
-    assert_eq!(block_on(s.next()), None);
+    let mut s = s.into_iter();
+    assert_eq!(s.next(), Some(1));
+    assert_eq!(s.next(), Some(2));
+    assert_eq!(s.next(), Some(3));
+    assert_eq!(s.next(), None);
+    assert_eq!(s.next(), None);
 }
 
 #[test]
@@ -83,11 +85,12 @@ fn basic_try_stream() {
         Result::<_, ()>::Ok(())
     };
     pin!(s);
-    assert_eq!(block_on(s.next()), Some(Ok(1)));
-    assert_eq!(block_on(s.next()), Some(Ok(2)));
-    assert_eq!(block_on(s.next()), Some(Ok(3)));
-    assert_eq!(block_on(s.next()), None);
-    assert_eq!(block_on(s.next()), None);
+    let mut s = s.into_iter();
+    assert_eq!(s.next(), Some(Ok(1)));
+    assert_eq!(s.next(), Some(Ok(2)));
+    assert_eq!(s.next(), Some(Ok(3)));
+    assert_eq!(s.next(), None);
+    assert_eq!(s.next(), None);
 }
 
 #[test]
@@ -99,12 +102,14 @@ fn try_stream_fail() {
         Ok(())
     };
     pin!(s);
-    assert_eq!(block_on(s.next()), Some(Ok(1)));
-    assert_eq!(block_on(s.next()), Some(Err(2)));
-    assert_eq!(block_on(s.next()), None);
-    assert_eq!(block_on(s.next()), None);
+    let mut s = s.into_iter();
+    assert_eq!(s.next(), Some(Ok(1)));
+    assert_eq!(s.next(), Some(Err(2)));
+    assert_eq!(s.next(), None);
+    assert_eq!(s.next(), None);
 }
 
+#[cfg(not(miri))]
 #[test]
 fn nest_try_stream() {
     let s = try_stream! {
@@ -114,17 +119,18 @@ fn nest_try_stream() {
             Result::<_, i32>::Ok(())
         };
         pin!(s2);
-        while let Some(item) = s2.next().await {
+        while let Some(item) = s2.stream_next().await {
             send!(item?);
         }
         send!(3);
         Ok(())
     };
     pin!(s);
-    assert_eq!(block_on(s.next()), Some(Ok(1)));
-    assert_eq!(block_on(s.next()), Some(Err(2)));
-    assert_eq!(block_on(s.next()), None);
-    assert_eq!(block_on(s.next()), None);
+    let mut s = s.into_iter();
+    assert_eq!(s.next(), Some(Ok(1)));
+    assert_eq!(s.next(), Some(Err(2)));
+    assert_eq!(s.next(), None);
+    assert_eq!(s.next(), None);
 }
 
 #[derive(Clone)]
@@ -172,7 +178,7 @@ fn test_drop_polled() {
             drop(chk2);
         };
         pin!(s);
-        assert_eq!(block_on(s.next()), Some(1));
+        assert_eq!(block_on(s.stream_next()), Some(1));
         assert_eq!(s.is_terminated(), false);
         assert_eq!(chk.count(), 0);
     }
@@ -189,9 +195,9 @@ fn test_drop_complete() {
             drop(chk2);
         };
         pin!(s);
-        assert_eq!(block_on(s.next()), Some(1));
+        assert_eq!(block_on(s.stream_next()), Some(1));
         assert_eq!(chk.count(), 0);
-        assert_eq!(block_on(s.next()), None);
+        assert_eq!(block_on(s.stream_next()), None);
         assert_eq!(s.is_terminated(), true);
         assert_eq!(chk.count(), 1);
     }
