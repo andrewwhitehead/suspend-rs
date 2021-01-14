@@ -14,7 +14,8 @@ fn park_thread_basic() {
                 thread::spawn(move || notifier.notify());
             },
             Duration::from_millis(100)
-        ),
+        )
+        .is_some(),
         true
     );
 }
@@ -23,7 +24,7 @@ fn park_thread_basic() {
 fn park_thread_timeout() {
     assert_eq!(
         park_thread(|_notifier| {}, Duration::from_millis(100)),
-        false
+        None
     );
 }
 

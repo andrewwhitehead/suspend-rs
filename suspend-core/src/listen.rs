@@ -8,6 +8,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
+use std::thread;
 use std::time::Instant;
 
 use crate::error::LockError;
@@ -46,10 +47,24 @@ pub fn block_on_poll<'s, T>(
     let timeout: Option<Instant> = timeout.into_opt_instant();
     with_listener(|guard, waker| {
         let mut cx = Context::from_waker(waker);
+        let mut repeat = 0usize;
         loop {
             let result = poll(&mut cx);
-            if result.is_ready() || !guard.wait(timeout).unwrap() {
+            if result.is_ready() {
                 break result;
+            }
+            match guard.wait(timeout).unwrap() {
+                Some(false) => {
+                    repeat += 1;
+                    if repeat >= 5 {
+                        // seem to be effectively in a spin loop, back off polling
+                        thread::yield_now();
+                    }
+                }
+                Some(true) => {
+                    repeat = 0;
+                }
+                None => break result,
             }
         }
     })
@@ -71,7 +86,7 @@ pub fn block_on_unpin<'s, T>(
 /// a `false` value is returned. Note that this function is susceptible to
 /// spurious notifications. Use a dedicated [`Listener`] instance if this is
 /// undesirable.
-pub fn park_thread<'s>(f: impl FnOnce(Notifier), timeout: impl Expiry) -> bool {
+pub fn park_thread<'s>(f: impl FnOnce(Notifier), timeout: impl Expiry) -> Option<bool> {
     let timeout: Option<Instant> = timeout.into_opt_instant();
     with_listener(|guard, _waker| {
         f(guard.notifier());
@@ -288,8 +303,8 @@ impl<'g> ListenerGuard<'g> {
     ///
     /// If the [`Listener`] instance has already been notified then this method will
     /// return immediately. The return value indicates whether a notification was
-    /// consumed, returning `false` in the case of a timeout.
-    pub fn wait(&mut self, timeout: impl Expiry) -> Result<bool, LockError> {
+    /// consumed, returning `None` in the case of a timeout.
+    pub fn wait(&mut self, timeout: impl Expiry) -> Result<Option<bool>, LockError> {
         unsafe { self.inner.to_ref() }
             .parker
             .park(timeout.into_opt_instant())

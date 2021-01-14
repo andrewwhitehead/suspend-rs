@@ -225,14 +225,14 @@ impl RawParker for ParkImpl {
         Ok(())
     }
 
-    fn park(&self, timeout: Option<Instant>) -> Result<bool, LockError> {
+    fn park(&self, timeout: Option<Instant>) -> Result<Option<bool>, LockError> {
         // relaxed ordering is suffient, we will check again after acquiring the mutex
         let mut state = self.state.load(Ordering::Relaxed);
         if state & STATE_UNPARK != 0 {
             // consume notification
             let found = self.state.swap(state & !STATE_UNPARK, Ordering::Acquire);
             debug_assert_eq!(found, state);
-            return Ok(true);
+            return Ok(Some(false));
         }
         if state & STATE_INIT == 0 {
             self.lock.init();
@@ -250,7 +250,7 @@ impl RawParker for ParkImpl {
             guard.unlock()?;
             let found = self.state.swap(state & !STATE_UNPARK, Ordering::Acquire);
             debug_assert_eq!(found, state);
-            return Ok(true);
+            return Ok(Some(false));
         }
 
         loop {
@@ -263,7 +263,11 @@ impl RawParker for ParkImpl {
                     .state
                     .swap(state & !(STATE_PARK | STATE_UNPARK), Ordering::Acquire);
                 guard.unlock()?;
-                return Ok(found & STATE_UNPARK != 0);
+                return Ok(if found & STATE_UNPARK != 0 {
+                    Some(true)
+                } else {
+                    None
+                });
             }
         }
     }

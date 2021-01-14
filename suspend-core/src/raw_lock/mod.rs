@@ -33,7 +33,7 @@ pub trait RawParker: RawInit {
 
     fn release(&self) -> Result<(), LockError>;
 
-    fn park(&self, timeout: Option<Instant>) -> Result<bool, LockError>;
+    fn park(&self, timeout: Option<Instant>) -> Result<Option<bool>, LockError>;
 
     fn unpark(&self) -> bool;
 }
@@ -93,7 +93,7 @@ macro_rules! parker_tests {
                     lock.acquire().expect("Error locking");
                     assert_eq!(lock.unpark(), true, "Expected notify to succeed");
                     let notified = lock.park(None).expect("Error parking");
-                    assert_eq!(notified, true, "Expected notified before park");
+                    assert_eq!(notified, Some(false), "Expected notified before park");
                     lock.release().expect("Error unlocking");
                 }
             }
@@ -109,7 +109,7 @@ macro_rules! parker_tests {
                     });
                     let expiry = Duration::from_millis(200).into_opt_instant();
                     let notified = lock.park(expiry).unwrap();
-                    assert_eq!(notified, true, "Expected notified during park");
+                    assert_eq!(notified.is_some(), true, "Expected notified during park");
                     th.join().unwrap();
                     lock.release().expect("Error unlocking");
                 }
@@ -123,7 +123,7 @@ macro_rules! parker_tests {
                     // no notifier
                     let expiry = Duration::from_millis(50).into_opt_instant();
                     let notified = lock.park(expiry).unwrap();
-                    assert_eq!(notified, false, "Expected no notification");
+                    assert_eq!(notified, None, "Expected no notification");
                     lock.release().expect("Error unlocking");
                 }
             }
