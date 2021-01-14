@@ -5,7 +5,7 @@ use once_cell::sync::Lazy;
 use suspend_core::listen::block_on;
 use suspend_exec::ThreadPool;
 
-#[cfg(target = "macos")]
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 

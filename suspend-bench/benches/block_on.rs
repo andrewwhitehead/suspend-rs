@@ -9,7 +9,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use futures_lite;
 use suspend_core;
 
-#[cfg(target = "macos")]
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 

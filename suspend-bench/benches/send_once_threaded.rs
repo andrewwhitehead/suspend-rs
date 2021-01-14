@@ -6,8 +6,9 @@ use futures_channel::oneshot as futures_oneshot;
 use oneshot_rs as oneshot;
 use suspend_channel::send_once;
 use suspend_core::listen::block_on;
+// use futures_lite::future::block_on;
 
-#[cfg(target = "macos")]
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
@@ -26,7 +27,7 @@ fn send_once_telephone(threads: usize) {
     assert_eq!(block_on(receiver), Ok(testval));
 }
 
-fn futures_telephone(threads: usize) {
+fn futures_oneshot_telephone(threads: usize) {
     let (sender, mut receiver) = futures_oneshot::channel();
     for _ in 0..threads {
         let (next_send, next_receive) = futures_oneshot::channel();
@@ -41,7 +42,7 @@ fn futures_telephone(threads: usize) {
     assert_eq!(block_on(receiver), Ok(testval));
 }
 
-fn oneshot_telephone(threads: usize) {
+fn faern_oneshot_telephone(threads: usize) {
     let (sender, mut receiver) = oneshot::channel();
     for _ in 0..threads {
         let (next_send, next_receive) = oneshot::channel();
@@ -66,17 +67,17 @@ fn bench_telephone(c: &mut Criterion) {
         },
     );
     c.bench_with_input(
-        BenchmarkId::new("futures-telephone", count),
+        BenchmarkId::new("futures-oneshot-telephone", count),
         &count,
         |b, &s| {
-            b.iter(|| futures_telephone(s));
+            b.iter(|| futures_oneshot_telephone(s));
         },
     );
     c.bench_with_input(
-        BenchmarkId::new("oneshot-telephone", count),
+        BenchmarkId::new("faern-oneshot-telephone", count),
         &count,
         |b, &s| {
-            b.iter(|| oneshot_telephone(s));
+            b.iter(|| faern_oneshot_telephone(s));
         },
     );
 }

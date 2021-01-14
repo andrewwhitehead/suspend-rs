@@ -5,7 +5,7 @@ use oneshot_rs as oneshot;
 use suspend_channel::send_once;
 use suspend_core::listen::block_on;
 
-#[cfg(target = "macos")]
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
@@ -27,7 +27,7 @@ fn test_futures_oneshot() {
     block_on(receiver).unwrap();
 }
 
-fn test_oneshot() {
+fn test_faern_oneshot() {
     let (sender, receiver) = oneshot::channel();
     sender.send(1).unwrap();
     block_on(receiver).unwrap();
@@ -43,8 +43,8 @@ fn bench_many(c: &mut Criterion) {
     c.bench_function("futures oneshot", move |b| {
         b.iter(|| test_futures_oneshot());
     });
-    c.bench_function("oneshot", move |b| {
-        b.iter(|| test_oneshot());
+    c.bench_function("faern oneshot", move |b| {
+        b.iter(|| test_faern_oneshot());
     });
 }
 
