@@ -79,6 +79,7 @@ impl<T> Channel<T> {
             panic!("Invalid send to loaded channel");
         }
         unsafe { self.value.store(value) };
+
         // fast path for no wakers
         if waker.is_none()
             && state & STATE_WAKE == 0
@@ -94,23 +95,39 @@ impl<T> Channel<T> {
         {
             return Ok(());
         }
+
         // release - sync update to the store, above. acquire - sync update to the waker, below.
         let mut prev = self
             .state
             .fetch_or(STATE_LOADED | STATE_WLOCK | STATE_WAKE, Ordering::AcqRel);
+
         if prev & STATE_WLOCK == 0 {
-            let recv_waker = if prev & STATE_WAKE != 0 {
+            // acquired waker lock
+            let read_waker = if prev & STATE_WAKE != 0 {
                 Some(unsafe { self.waker.load() })
             } else {
                 None
             };
             if let Some(waker) = waker.take() {
                 unsafe { self.waker.store(waker.clone()) };
-                prev = self.state.fetch_and(!STATE_WLOCK, Ordering::Release);
-                if prev & STATE_ACTIVE == 0 {
+                if let Err(s) = self.state.compare_exchange(
+                    prev | STATE_LOADED | STATE_WLOCK | STATE_WAKE,
+                    prev | STATE_LOADED | STATE_WAKE,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
                     // drop the waker we just stored
                     unsafe { self.waker.clear() };
-                    return Err(unsafe { self.value.load() });
+                    if s & STATE_LOADED == 0 || s & STATE_RLOCK != 0 {
+                        self.state
+                            .fetch_and(!(STATE_WLOCK | STATE_WAKE), Ordering::Release);
+                        waker.wake_by_ref();
+                        return Ok(());
+                    } else if s & STATE_ACTIVE == 0 {
+                        return Err(unsafe { self.value.load() });
+                    } else {
+                        panic!("Invalid channel state {}", s);
+                    }
                 }
             } else {
                 let remove = STATE_WLOCK | STATE_WAKE | (finalize as u8 * STATE_ACTIVE);
@@ -119,14 +136,11 @@ impl<T> Channel<T> {
                     return Err(unsafe { self.value.load() });
                 }
             }
-            recv_waker.map(Waker::wake);
+            read_waker.map(Waker::wake);
         } else {
             // reader locked the waker. it will see STATE_LOADED when it unlocks
             // and take the value immediately. call our waker to proceed to flush()
-            if let Some(waker) = waker {
-                waker.wake_by_ref();
-            }
-            // note: reader will also reset the WAKE flag appropriately
+            waker.map(Waker::wake_by_ref);
         }
         Ok(())
     }
@@ -135,8 +149,13 @@ impl<T> Channel<T> {
         let mut prev = self.state.load(Ordering::Relaxed);
         let mut locked = false;
         loop {
-            if prev & STATE_LOADED == 0 {
+            if prev & (STATE_LOADED | STATE_RLOCK) == 0 {
+                // loaded value has been read
                 if locked {
+                    if prev & STATE_WAKE != 0 {
+                        // take previous writer waker
+                        unsafe { self.waker.clear() };
+                    }
                     // reset state
                     let remove = STATE_WLOCK | STATE_WAKE | (finalize as u8 * STATE_ACTIVE);
                     self.state.fetch_and(!remove, Ordering::Relaxed);
@@ -151,7 +170,7 @@ impl<T> Channel<T> {
                 return Poll::Ready((None, prev & STATE_ACTIVE == 0));
             }
             if prev & STATE_ACTIVE == 0 {
-                // writer dropped, leaving value. there must not be a waker
+                // reader dropped, leaving value. there must not be a waker
                 if !finalize {
                     // clear LOADED flag for when the writer drops
                     self.state.store(STATE_DONE, Ordering::Relaxed);
@@ -161,6 +180,7 @@ impl<T> Channel<T> {
             if prev & STATE_RLOCK != 0 {
                 // read in progress, just call waker
                 // reader would have also set WLOCK and WAKE, so leave them alone
+                // FIXME spin for a little before calling waker
                 waker.wake_by_ref();
                 return Poll::Pending;
             }
@@ -170,17 +190,39 @@ impl<T> Channel<T> {
                     unsafe { self.waker.clear() };
                 }
                 unsafe { self.waker.store(waker.clone()) };
-                return Poll::Pending;
+                match self.state.compare_exchange_weak(
+                    prev | STATE_WLOCK | STATE_WAKE,
+                    prev | STATE_WAKE,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        return Poll::Pending;
+                    }
+                    Err(_) => {
+                        // reader started loading the value or dropped
+                        // remove the waker we just stored
+                        unsafe {
+                            self.waker.clear();
+                        }
+                        // unlock and check status again
+                        prev = self
+                            .state
+                            .fetch_and(!(STATE_WLOCK | STATE_WAKE), Ordering::Release)
+                            & !(STATE_WLOCK | STATE_WAKE);
+                        locked = false;
+                    }
+                }
             } else {
-                prev = match self.state.compare_exchange(
+                match self.state.compare_exchange_weak(
                     prev,
                     prev | STATE_WLOCK | STATE_WAKE,
                     Ordering::Acquire,
-                    Ordering::Acquire,
+                    Ordering::Relaxed,
                 ) {
                     Ok(s) => {
                         locked = true;
-                        s
+                        prev = s
                     }
                     Err(s) if s & STATE_WLOCK != 0 => {
                         // read in progress, just call waker
@@ -189,7 +231,7 @@ impl<T> Channel<T> {
                     }
                     Err(s) => {
                         // read completed or reader dropped, retry
-                        s
+                        prev = s
                     }
                 };
             }
@@ -197,64 +239,112 @@ impl<T> Channel<T> {
     }
 
     pub fn read(&self, mut waker: Option<&Waker>, or_cancel: bool) -> Poll<(Option<T>, bool)> {
-        let mut prev = self
-            .state
-            .fetch_or(STATE_RLOCK | STATE_WLOCK | STATE_WAKE, Ordering::Acquire);
-        let (locked, prev_wake) = (prev & STATE_WLOCK == 0, prev & STATE_WAKE != 0);
-        if prev & STATE_LOADED != 0 {
-            let value = unsafe { self.value.load() };
-            let send_waker = if locked && prev_wake {
-                Some(unsafe { self.waker.load() })
-            } else {
-                None
-            };
-            if locked {
-                prev = self.state.fetch_and(
-                    !(STATE_LOADED | STATE_WLOCK | STATE_WAKE | STATE_RLOCK),
-                    Ordering::Release,
-                );
-            } else {
-                // leave WLOCK and WAKE for the writer to control
-                prev = self
-                    .state
-                    .fetch_and(!(STATE_RLOCK | STATE_LOADED), Ordering::Release);
-            }
-            send_waker.map(Waker::wake);
-            Poll::Ready((Some(value), prev & STATE_ACTIVE == 0))
-        } else {
-            // a value was loaded
-
-            // WLOCK without LOADED should only be set by read()
-            assert_eq!(locked, true, "Should not be locked");
-
-            if prev_wake {
-                // drop previous receive waker
-                unsafe { self.waker.clear() };
-            }
-            if prev & STATE_ACTIVE != 0 {
-                if let Some(waker) = waker.take() {
-                    unsafe { self.waker.store(waker.clone()) };
-                    prev = self
-                        .state
-                        .fetch_and(!(STATE_RLOCK | STATE_WLOCK), Ordering::Release);
-                    if prev & STATE_ACTIVE == 0 {
-                        // drop waker we just stored
-                        unsafe { self.waker.clear() };
-                    }
+        let mut prev = self.state.load(Ordering::Relaxed);
+        loop {
+            if prev & STATE_ACTIVE == 0 {
+                // writer dropped
+                if prev & STATE_LOADED != 0 {
+                    // sync with the write
+                    let found = self.state.swap(prev & !STATE_LOADED, Ordering::Acquire);
+                    debug_assert_eq!(found, prev);
+                    let value = unsafe { self.value.load() };
+                    return Poll::Ready((Some(value), true));
                 } else {
-                    let remove =
-                        STATE_RLOCK | STATE_WLOCK | STATE_WAKE | (or_cancel as u8 * STATE_ACTIVE);
-                    prev = self.state.fetch_and(!remove, Ordering::Release);
+                    return Poll::Ready((None, true));
                 }
             }
+
             if prev & STATE_LOADED != 0 {
-                // writer loaded a value while we were locked - retry
-                self.read(None, or_cancel)
-            } else if prev & STATE_ACTIVE == 0 {
-                // writer dropped
-                Poll::Ready((None, true))
+                // value loaded, writer active
+                match self.state.compare_exchange_weak(
+                    prev,
+                    prev | STATE_RLOCK | STATE_WLOCK,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        let value = unsafe { self.value.load() };
+                        let flush_waker = if prev & (STATE_WLOCK | STATE_WAKE) == STATE_WAKE {
+                            Some(unsafe { self.waker.load() })
+                        } else {
+                            None
+                        };
+                        let unlock = STATE_LOADED
+                            | STATE_RLOCK
+                            | if prev & STATE_WLOCK == 0 {
+                                STATE_WLOCK | STATE_WAKE
+                            } else {
+                                0
+                            };
+                        prev = self.state.fetch_and(!unlock, Ordering::Release);
+                        flush_waker.map(Waker::wake);
+                        return Poll::Ready((Some(value), prev & STATE_ACTIVE == 0));
+                    }
+                    Err(s) => prev = s,
+                }
+            } else if or_cancel {
+                match self.state.compare_exchange(
+                    prev,
+                    prev & !STATE_ACTIVE,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        return Poll::Ready((None, false));
+                    }
+                    Err(s) => prev = s,
+                }
+            } else if waker.is_some() || prev & STATE_WAKE != 0 {
+                if prev & STATE_WLOCK != 0 {
+                    // waker locked by writer
+                    waker.map(Waker::wake_by_ref);
+                    return Poll::Pending;
+                }
+
+                // a value was not yet loaded, try to store a waker
+                match self.state.compare_exchange_weak(
+                    prev,
+                    prev | STATE_RLOCK | STATE_WLOCK | STATE_WAKE,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        if prev & STATE_WAKE != 0 {
+                            // drop previous reader waker
+                            unsafe { self.waker.clear() };
+                        }
+                        if let Some(waker) = waker.take() {
+                            unsafe { self.waker.store(waker.clone()) };
+                            match self.state.compare_exchange(
+                                prev | STATE_RLOCK | STATE_WLOCK | STATE_WAKE,
+                                prev | STATE_WAKE,
+                                Ordering::Release,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => return Poll::Pending,
+                                Err(_) => {
+                                    // drop waker we just stored
+                                    unsafe { self.waker.clear() };
+                                    prev = self.state.fetch_and(
+                                        !(STATE_RLOCK | STATE_WLOCK | STATE_WAKE),
+                                        Ordering::Release,
+                                    ) & !(STATE_RLOCK | STATE_WLOCK | STATE_WAKE);
+                                }
+                            }
+                        } else {
+                            prev = self.state.fetch_and(
+                                !(STATE_RLOCK | STATE_WLOCK | STATE_WAKE),
+                                Ordering::Release,
+                            ) & !(STATE_RLOCK | STATE_WLOCK | STATE_WAKE);
+                            if prev & (STATE_LOADED | STATE_ACTIVE) == STATE_ACTIVE {
+                                return Poll::Ready((None, false));
+                            }
+                        }
+                    }
+                    Err(s) => prev = s,
+                }
             } else {
-                Poll::Pending
+                return Poll::Ready((None, false));
             }
         }
     }
@@ -762,7 +852,7 @@ impl<T> Stream for Receiver<T> {
     type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        if let Some(channel) = self.channel.clone() {
+        if let Some(channel) = self.channel {
             unsafe { channel.to_ref() }
                 .read(Some(cx.waker()), false)
                 .map(|(result, dropped)| {
