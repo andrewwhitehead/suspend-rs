@@ -176,6 +176,8 @@ impl<T> Drop for JoinTask<'_, T> {
     }
 }
 
+unsafe impl<T: Send> Send for JoinTask<'_, T> {}
+
 impl<T> Unpin for JoinTask<'_, T> {}
 
 /// A handle for a heap-allocated task
