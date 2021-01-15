@@ -14,9 +14,9 @@ use core::{
     time::Duration,
 };
 use libc;
-use std::time::Instant;
 
-use super::{HasGuard, LockError, RawGuard, RawInit, RawLock, RawParker};
+use super::{LockError, RawParker};
+use crate::types::{Expiry, ParkResult};
 
 const STATE_FREE: usize = 0b0000;
 const STATE_INIT: usize = 0b0001;
@@ -32,105 +32,6 @@ type tv_nsec_t = i64;
 #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "32")))]
 #[allow(non_camel_case_types)]
 type tv_nsec_t = libc::c_long;
-
-pub struct LockImpl {
-    cond: UnsafeCell<libc::pthread_cond_t>,
-    mutex: UnsafeCell<libc::pthread_mutex_t>,
-}
-
-impl LockImpl {
-    pub const fn new_uninit() -> Self {
-        Self {
-            cond: UnsafeCell::new(libc::PTHREAD_COND_INITIALIZER),
-            mutex: UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER),
-        }
-    }
-
-    #[inline]
-    pub fn init(&self) {
-        mutex_init(self.mutex.get());
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
-        condvar_init(self.cond.get());
-    }
-}
-
-impl RawInit for LockImpl {
-    #[inline]
-    fn new() -> Self {
-        let slf = Self::new_uninit();
-        slf.init();
-        slf
-    }
-}
-
-impl RawLock for LockImpl {
-    #[inline]
-    fn lock(&self) -> Result<GuardImpl, LockError> {
-        let r = unsafe { libc::pthread_mutex_lock(self.mutex.get()) };
-        if r != 0 {
-            return Err(LockError::InvalidState);
-        }
-        Ok(GuardImpl {
-            mutex: self.mutex.get(),
-            cond: self.cond.get(),
-        })
-    }
-
-    #[inline]
-    fn try_lock(&self) -> Result<<Self as HasGuard<'_>>::Guard, LockError> {
-        let r = unsafe { libc::pthread_mutex_trylock(self.mutex.get()) };
-        if r == libc::EBUSY {
-            return Err(LockError::Contended);
-        } else if r != 0 {
-            return Err(LockError::InvalidState);
-        }
-        Ok(GuardImpl {
-            mutex: self.mutex.get(),
-            cond: self.cond.get(),
-        })
-    }
-
-    #[inline]
-    fn notify_one(&self) {
-        let r = unsafe { libc::pthread_cond_signal(self.cond.get()) };
-        assert_eq!(r, 0);
-    }
-
-    #[inline]
-    fn notify_all(&self) {
-        let r = unsafe { libc::pthread_cond_broadcast(self.cond.get()) };
-        assert_eq!(r, 0);
-    }
-}
-
-impl Drop for LockImpl {
-    #[inline]
-    fn drop(&mut self) {
-        // On DragonFly pthread_mutex_destroy() returns EINVAL if called on a
-        // mutex that was just initialized with libc::PTHREAD_MUTEX_INITIALIZER.
-        // Once it is used (locked/unlocked) or pthread_mutex_init() is called,
-        // this behaviour no longer occurs. The same applies to condvars.
-        unsafe {
-            let r = libc::pthread_mutex_destroy(self.mutex.get());
-            debug_assert!(r == 0 || r == libc::EINVAL);
-            let r = libc::pthread_cond_destroy(self.cond.get());
-            debug_assert!(r == 0 || r == libc::EINVAL);
-        }
-    }
-}
-
-unsafe impl Send for LockImpl {}
-unsafe impl Sync for LockImpl {}
-
-impl Debug for LockImpl {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("pthread::LockImpl").finish()
-    }
-}
-
-impl<'g> HasGuard<'g> for LockImpl {
-    type Guard = GuardImpl;
-}
 
 #[derive(Debug)]
 pub struct GuardImpl {
@@ -148,12 +49,10 @@ impl GuardImpl {
         }
         Ok(())
     }
-}
 
-impl<'g> RawGuard<'g> for GuardImpl {
-    fn wait(self, timeout: Option<Instant>) -> Result<(Self, bool), LockError> {
-        if let Some(exp) = timeout {
-            if let Some(dur) = exp.checked_duration_since(Instant::now()) {
+    fn wait(self, timeout: Expiry) -> Result<(Self, bool), LockError> {
+        if timeout.is_some() {
+            if let Some(dur) = timeout.checked_duration() {
                 if let Some(ts) = timeout_to_timespec(dur) {
                     let r = unsafe { libc::pthread_cond_timedwait(self.cond, self.mutex, &ts) };
                     if r == libc::ETIMEDOUT {
@@ -191,19 +90,39 @@ impl Drop for GuardImpl {
 }
 
 pub struct ParkImpl {
-    lock: LockImpl,
+    cond: UnsafeCell<libc::pthread_cond_t>,
+    mutex: UnsafeCell<libc::pthread_mutex_t>,
     state: AtomicUsize,
 }
 
 unsafe impl Send for ParkImpl {}
 unsafe impl Sync for ParkImpl {}
 
-impl RawInit for ParkImpl {
-    #[inline]
-    fn new() -> Self {
+impl ParkImpl {
+    pub const fn new() -> Self {
         Self {
-            lock: LockImpl::new_uninit(),
+            cond: UnsafeCell::new(libc::PTHREAD_COND_INITIALIZER),
+            mutex: UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER),
             state: AtomicUsize::new(STATE_FREE),
+        }
+    }
+
+    #[inline]
+    fn lock_init(&self) {
+        condvar_init(self.cond.get());
+        mutex_init(self.mutex.get());
+    }
+
+    fn lock_destroy(&self) {
+        // On DragonFly pthread_mutex_destroy() returns EINVAL if called on a
+        // mutex that was just initialized with libc::PTHREAD_MUTEX_INITIALIZER.
+        // Once it is used (locked/unlocked) or pthread_mutex_init() is called,
+        // this behaviour no longer occurs. The same applies to condvars.
+        unsafe {
+            let r = libc::pthread_mutex_destroy(self.mutex.get());
+            debug_assert!(r == 0 || r == libc::EINVAL);
+            let r = libc::pthread_cond_destroy(self.cond.get());
+            debug_assert!(r == 0 || r == libc::EINVAL);
         }
     }
 }
@@ -225,20 +144,32 @@ impl RawParker for ParkImpl {
         Ok(())
     }
 
-    fn park(&self, timeout: Option<Instant>) -> Result<Option<bool>, LockError> {
+    fn park(&self, timeout: Expiry) -> Result<ParkResult, LockError> {
         // relaxed ordering is suffient, we will check again after acquiring the mutex
         let mut state = self.state.load(Ordering::Relaxed);
         if state & STATE_UNPARK != 0 {
             // consume notification
             let found = self.state.swap(state & !STATE_UNPARK, Ordering::Acquire);
             debug_assert_eq!(found, state);
-            return Ok(Some(false));
+            return Ok(ParkResult::Skipped);
         }
-        if state & STATE_INIT == 0 {
-            self.lock.init();
+        let inited = state & STATE_INIT != 0;
+        if !inited {
+            self.lock_init();
         }
 
-        let mut guard = self.lock.lock()?;
+        let r = unsafe { libc::pthread_mutex_lock(self.mutex.get()) };
+        if r != 0 {
+            if !inited {
+                // state has not yet been updated to reflect init
+                self.lock_destroy();
+            }
+            return Err(LockError::InvalidState);
+        }
+        let mut guard = GuardImpl {
+            mutex: self.mutex.get(),
+            cond: self.cond.get(),
+        };
 
         // relaxed is okay here because unpark will acquire the mutex before notifying
         state = self
@@ -250,7 +181,7 @@ impl RawParker for ParkImpl {
             guard.unlock()?;
             let found = self.state.swap(state & !STATE_UNPARK, Ordering::Acquire);
             debug_assert_eq!(found, state);
-            return Ok(Some(false));
+            return Ok(ParkResult::Skipped);
         }
 
         loop {
@@ -264,9 +195,9 @@ impl RawParker for ParkImpl {
                     .swap(state & !(STATE_PARK | STATE_UNPARK), Ordering::Acquire);
                 guard.unlock()?;
                 return Ok(if found & STATE_UNPARK != 0 {
-                    Some(true)
+                    ParkResult::Unparked
                 } else {
-                    None
+                    ParkResult::TimedOut
                 });
             }
         }
@@ -278,9 +209,13 @@ impl RawParker for ParkImpl {
             if found & STATE_PARK != 0 {
                 // acquire the mutex because the parking thread could be interrupted
                 // between setting the state and waiting on the condvar
-                drop(self.lock.lock().unwrap());
+                let r = unsafe { libc::pthread_mutex_lock(self.mutex.get()) };
+                assert_eq!(r, 0);
+                let r = unsafe { libc::pthread_mutex_unlock(self.mutex.get()) };
+                assert_eq!(r, 0);
                 // wake the parked thread
-                self.lock.notify_one();
+                let r = unsafe { libc::pthread_cond_signal(self.cond.get()) };
+                assert_eq!(r, 0);
             }
             true
         } else {
@@ -295,20 +230,31 @@ impl Debug for ParkImpl {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+impl Drop for ParkImpl {
+    fn drop(&mut self) {
+        if self.state.load(Ordering::Relaxed) & STATE_INIT != 0 {
+            self.lock_destroy();
+        }
+    }
+}
+
 #[inline]
+#[allow(unused_variables)]
 fn condvar_init(cvar: *mut libc::pthread_cond_t) {
-    // Initializes the condvar to use CLOCK_MONOTONIC instead of CLOCK_REALTIME.
-    let mut attr = MaybeUninit::<libc::pthread_condattr_t>::uninit();
-    unsafe {
-        let r = libc::pthread_condattr_init(attr.as_mut_ptr());
-        assert_eq!(r, 0);
-        let r = libc::pthread_condattr_setclock(attr.as_mut_ptr(), libc::CLOCK_MONOTONIC);
-        assert_eq!(r, 0);
-        let r = libc::pthread_cond_init(cvar, attr.as_ptr());
-        assert_eq!(r, 0);
-        let r = libc::pthread_condattr_destroy(attr.as_mut_ptr());
-        assert_eq!(r, 0);
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+    {
+        // Initializes the condvar to use CLOCK_MONOTONIC instead of CLOCK_REALTIME.
+        let mut attr = MaybeUninit::<libc::pthread_condattr_t>::uninit();
+        unsafe {
+            let r = libc::pthread_condattr_init(attr.as_mut_ptr());
+            assert_eq!(r, 0);
+            let r = libc::pthread_condattr_setclock(attr.as_mut_ptr(), libc::CLOCK_MONOTONIC);
+            assert_eq!(r, 0);
+            let r = libc::pthread_cond_init(cvar, attr.as_ptr());
+            assert_eq!(r, 0);
+            let r = libc::pthread_condattr_destroy(attr.as_mut_ptr());
+            assert_eq!(r, 0);
+        }
     }
 }
 

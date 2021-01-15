@@ -16,7 +16,8 @@ name = "suspend_core"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["std"]
+std = []
 
 [dependencies]
 cfg-if = "1.0"

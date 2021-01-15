@@ -16,12 +16,13 @@ name = "suspend_channel"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["std"]
+std = ["suspend-core/std"]
 
 [dependencies]
 futures-core = "0.3"
 maybe-cell = { version = "0.1", path = "../maybe-cell" }
-suspend-core = { version = "0.1", path = "../suspend-core" }
+suspend-core = { version = "0.1", path = "../suspend-core", default-features = false }
 
 [dev-dependencies]
 futures-task = "0.3"

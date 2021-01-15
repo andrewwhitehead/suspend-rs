@@ -6,8 +6,8 @@ use std::thread;
 use std::time::Duration;
 
 use suspend_core::{
-    listen::{block_on, block_on_poll},
     pin,
+    thread::{block_on, block_on_poll},
 };
 use suspend_exec::{RecvError, ThreadPool, ThreadPoolConfig};
 

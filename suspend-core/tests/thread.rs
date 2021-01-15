@@ -1,10 +1,12 @@
+#![cfg(feature = "std")]
+
 use std::task::Poll;
 use std::thread;
 use std::time::Duration;
 
 use futures_lite::future;
 
-use suspend_core::listen::{block_on, block_on_poll, park_thread};
+use suspend_core::thread::{block_on, block_on_poll, park_thread};
 
 #[test]
 fn park_thread_basic() {
@@ -15,7 +17,7 @@ fn park_thread_basic() {
             },
             Duration::from_millis(100)
         )
-        .is_some(),
+        .timed_out(),
         true
     );
 }
@@ -23,8 +25,8 @@ fn park_thread_basic() {
 #[test]
 fn park_thread_timeout() {
     assert_eq!(
-        park_thread(|_notifier| {}, Duration::from_millis(100)),
-        None
+        park_thread(|_notifier| {}, Duration::from_millis(100)).timed_out(),
+        true
     );
 }
 

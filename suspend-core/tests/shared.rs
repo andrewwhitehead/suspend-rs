@@ -4,12 +4,14 @@ use std::task::Poll;
 use std::thread;
 
 use suspend_core::{
-    listen::block_on_poll,
     pin,
     shared::{with_scope, PinShared, Shared},
 };
 
-use self::utils::{notify_pair, run_test, Track};
+#[cfg(feature = "std")]
+use suspend_core::thread::block_on_poll;
+
+use self::utils::{notify_pair, Track};
 
 mod utils;
 
@@ -50,30 +52,29 @@ fn shared_borrow_collect() {
 
 #[test]
 fn shared_borrow_collect_threaded() {
-    run_test(|| {
-        let mut shared = Shared::new(true);
-        let threads = (0..10)
-            .map(|_| {
-                thread::spawn({
-                    let borrow = shared.borrow();
-                    move || {
-                        drop(borrow);
-                    }
-                })
+    let mut shared = Shared::new(true);
+    let threads = (0..10)
+        .map(|_| {
+            thread::spawn({
+                let borrow = shared.borrow();
+                move || {
+                    drop(borrow);
+                }
             })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            shared
-                .collect(Duration::from_millis(500))
-                .expect("Error collecting shared"),
-            true
-        );
-        for th in threads {
-            th.join().expect("Error joining thread");
-        }
-    })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shared
+            .collect(Duration::from_millis(500))
+            .expect("Error collecting shared"),
+        true
+    );
+    for th in threads {
+        th.join().expect("Error joining thread");
+    }
 }
 
+#[cfg(feature = "std")]
 #[test]
 fn pin_shared_async_poll_and_drop() {
     // test that dropping the future after the task is queued

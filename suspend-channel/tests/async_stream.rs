@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -5,7 +7,7 @@ use std::sync::{
 
 use futures_core::FusedStream;
 use suspend_channel::{async_stream::make_stream, stream, try_stream, StreamIterExt};
-use suspend_core::{listen::block_on, pin};
+use suspend_core::{pin, thread::block_on};
 
 #[test]
 fn non_macro() {

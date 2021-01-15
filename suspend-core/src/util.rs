@@ -7,6 +7,9 @@ use core::{
     ptr::NonNull,
 };
 
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+
 /// A convenient wrapper around a boxed allocation allowing usage
 /// as a shared reference
 #[repr(transparent)]

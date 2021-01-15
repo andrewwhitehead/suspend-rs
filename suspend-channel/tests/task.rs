@@ -3,7 +3,7 @@ use std::thread;
 use std::time::Duration;
 
 use suspend_channel::{task::task_fn, RecvError};
-use suspend_core::listen::block_on;
+use suspend_core::thread::block_on;
 
 use self::utils::TestDrop;
 

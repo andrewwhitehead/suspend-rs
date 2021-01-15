@@ -1,18 +1,26 @@
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+extern crate alloc;
+
+use alloc::sync::Arc;
+use core::{
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicUsize, Ordering},
+    task::{Context, Poll},
 };
-use std::task::{Context, Poll};
+
+#[cfg(feature = "std")]
+use core::time::Duration;
+
+#[cfg(feature = "std")]
 use std::thread;
-use std::time::Duration;
 
 use futures_core::FusedFuture;
 use futures_task::{waker_ref, ArcWake};
 
-use suspend_channel::{send_once, RecvError, StreamIterExt, TrySendError};
-use suspend_core::listen::block_on;
+use suspend_channel::{send_once, RecvError, TrySendError};
+
+#[cfg(feature = "std")]
+use suspend_core::thread::block_on;
 
 mod utils;
 use utils::TestDrop;
@@ -71,6 +79,7 @@ fn send_once_receive_poll() {
     }
 }
 
+#[cfg(feature = "std")]
 #[test]
 fn send_once_receive_block_on() {
     let (sender, receiver) = send_once();
@@ -78,6 +87,7 @@ fn send_once_receive_block_on() {
     assert_eq!(block_on(receiver), Ok(1u32));
 }
 
+#[cfg(feature = "std")]
 #[test]
 fn send_once_receive_wait() {
     let (sender, receiver) = send_once();
@@ -85,6 +95,7 @@ fn send_once_receive_wait() {
     assert_eq!(receiver.recv(), Ok(1u32));
 }
 
+#[cfg(feature = "std")]
 #[test]
 fn send_once_receive_wait_timeout() {
     let (sender, mut receiver) = send_once();
@@ -100,6 +111,7 @@ fn send_once_receive_wait_timeout() {
     );
 }
 
+#[cfg(feature = "std")]
 #[test]
 fn send_once_threaded() {
     let (sender0, receiver0) = send_once();
@@ -145,10 +157,10 @@ fn send_once_receiver_dropped_incomplete() {
 
 #[test]
 fn send_once_receiver_dropped_complete() {
-    let (sender, receiver) = send_once();
+    let (sender, mut receiver) = send_once();
     let (message, drops) = TestDrop::new_pair();
     sender.try_send(message).unwrap();
-    let result = block_on(receiver).unwrap();
+    let result = receiver.try_recv();
     assert_eq!(drops.count(), 0);
     drop(result);
     assert_eq!(drops.count(), 1);
@@ -159,9 +171,9 @@ fn send_once_receiver_stream_one() {
     let (sender, mut receiver) = send_once::<u32>();
     sender.try_send(5).unwrap();
     assert_eq!(receiver.is_terminated(), false);
-    assert_eq!(block_on(receiver.stream_next()), Some(5));
+    assert_eq!(receiver.try_recv(), Poll::Ready(Some(5)));
     assert_eq!(receiver.is_terminated(), true);
-    assert_eq!(block_on(receiver.stream_next()), None);
+    assert_eq!(receiver.try_recv(), Poll::Ready(None));
     assert_eq!(receiver.is_terminated(), true);
 }
 
@@ -170,7 +182,7 @@ fn send_once_receiver_stream_empty() {
     let (sender, mut receiver) = send_once::<u32>();
     drop(sender);
     assert_eq!(receiver.is_terminated(), true);
-    assert_eq!(block_on(receiver.stream_next()), None);
+    assert_eq!(receiver.try_recv(), Poll::Ready(None));
     assert_eq!(receiver.is_terminated(), true);
 }
 
@@ -190,7 +202,7 @@ fn send_once_receiver_cancel_late() {
 
 #[test]
 fn send_once_flush_waker_test() {
-    let (sender, receiver) = send_once();
+    let (sender, mut receiver) = send_once();
     let (message, drops) = TestDrop::new_pair();
     let waker = Arc::new(TestWaker::new());
     let wr = waker_ref(&waker);
@@ -202,7 +214,7 @@ fn send_once_flush_waker_test() {
     assert_eq!(waker.count(), 0);
     assert_eq!(drops.count(), 0);
 
-    let result = block_on(receiver).unwrap();
+    let result = receiver.try_recv();
     assert_eq!(drops.count(), 0);
     assert_eq!(waker.count(), 1);
     assert_eq!(flush.is_terminated(), false);

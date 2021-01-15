@@ -1,114 +1,15 @@
 //! Methods and primitives for waiting on notifications.
 
 use core::{
-    cell::RefCell,
-    future::Future,
     marker::PhantomData,
-    pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    task::{RawWaker, RawWakerVTable, Waker},
 };
-use std::thread;
-use std::time::Instant;
 
 use crate::error::LockError;
-use crate::raw_lock::{NativeParker, RawInit, RawParker};
-use crate::types::Expiry;
+use crate::raw_park::{NativeParker, RawParker};
+use crate::types::{Expiry, ParkResult};
 use crate::util::BoxPtr;
-
-thread_local! {
-    pub(crate) static THREAD_LISTEN: RefCell<(Listener, Waker)> = {
-        let listener = Listener::new();
-        let waker = listener.waker();
-        RefCell::new((listener, waker))
-    };
-}
-
-/// Block the current thread on the result of a [`Future`].
-pub fn block_on<'s, T>(fut: impl Future<Output = T>) -> T {
-    pin!(fut);
-    with_listener(|guard, waker| {
-        let mut cx = Context::from_waker(waker);
-        loop {
-            if let Poll::Ready(result) = fut.as_mut().poll(&mut cx) {
-                break result;
-            }
-            guard.wait(None).unwrap();
-        }
-    })
-}
-
-/// Block the current thread on the result of a poll function, with an optional timeout.
-/// A [`None`] value is returned if the timeout is reached.
-pub fn block_on_poll<'s, T>(
-    mut poll: impl FnMut(&mut Context<'_>) -> Poll<T>,
-    timeout: impl Expiry,
-) -> Poll<T> {
-    let timeout: Option<Instant> = timeout.into_opt_instant();
-    with_listener(|guard, waker| {
-        let mut cx = Context::from_waker(waker);
-        let mut repeat = 0usize;
-        loop {
-            let result = poll(&mut cx);
-            if result.is_ready() {
-                break result;
-            }
-            match guard.wait(timeout).unwrap() {
-                Some(false) => {
-                    repeat += 1;
-                    if repeat >= 5 {
-                        // seem to be effectively in a spin loop, back off polling
-                        thread::yield_now();
-                    }
-                }
-                Some(true) => {
-                    repeat = 0;
-                }
-                None => break result,
-            }
-        }
-    })
-}
-
-/// Block the current thread on the result of a [`Future`] + [`Unpin`], with an
-/// optional timeout. A [`None`] value is returned if the timeout is reached.
-#[inline]
-pub fn block_on_unpin<'s, T>(
-    mut fut: impl Future<Output = T> + Unpin,
-    timeout: impl Expiry,
-) -> Poll<T> {
-    let timeout: Option<Instant> = timeout.into_opt_instant();
-    block_on_poll(|cx| Pin::new(&mut fut).poll(cx), timeout)
-}
-
-/// Park the current thread until notified, with an optional timeout.
-/// If a timeout is specified and reached before there is a notification, then
-/// a `false` value is returned. Note that this function is susceptible to
-/// spurious notifications. Use a dedicated [`Listener`] instance if this is
-/// undesirable.
-pub fn park_thread<'s>(f: impl FnOnce(Notifier), timeout: impl Expiry) -> Option<bool> {
-    let timeout: Option<Instant> = timeout.into_opt_instant();
-    with_listener(|guard, _waker| {
-        f(guard.notifier());
-        guard.wait(timeout).unwrap()
-    })
-}
-
-fn with_listener<T>(f: impl FnOnce(&mut ListenerGuard<'_>, &Waker) -> T) -> T {
-    THREAD_LISTEN.with(|cached| {
-        if let Ok(mut borrowed) = cached.try_borrow_mut() {
-            let (listen, waker) = &mut *borrowed;
-            let mut guard = listen.get_mut();
-            f(&mut guard, waker)
-        } else {
-            // thread listener in use, create a new one
-            let mut listen = Listener::new();
-            let mut guard = listen.get_mut();
-            let waker = guard.waker();
-            f(&mut guard, &waker)
-        }
-    })
-}
 
 /// A structure providing thread parking and notification operations.
 #[derive(Debug)]
@@ -190,13 +91,11 @@ impl ListenInner {
         BoxPtr::alloc(Self::new())
     }
 
-    #[inline]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self::new_with_count(1)
     }
 
-    #[inline]
-    pub fn new_with_count(count: usize) -> Self {
+    pub const fn new_with_count(count: usize) -> Self {
         Self {
             count: AtomicUsize::new(count),
             parker: NativeParker::new(),
@@ -284,6 +183,17 @@ impl<'g> ListenerGuard<'g> {
         }
     }
 
+    /// Park the current thread until the next notification, with an optional timeout.
+    /// The timeout may be provided as an optional [`Instant`] or a
+    /// [`Duration`](std::time::Duration).
+    ///
+    /// If the [`Listener`] instance has already been notified then this method will
+    /// return immediately. The return value indicates whether a notification was
+    /// consumed, returning `None` in the case of a timeout.
+    pub fn park(&mut self, timeout: impl Into<Expiry>) -> Result<ParkResult, LockError> {
+        unsafe { self.inner.to_ref() }.parker.park(timeout.into())
+    }
+
     /// Create a [`Notifier`] associated with the [`Listener`] instance.
     #[inline]
     pub fn notifier(&self) -> Notifier {
@@ -295,19 +205,6 @@ impl<'g> ListenerGuard<'g> {
     #[inline]
     pub fn waker(&self) -> Waker {
         ListenInner::waker(self.inner)
-    }
-
-    /// Park the current thread until the next notification, with an optional timeout.
-    /// The timeout may be provided as an optional [`Instant`] or a
-    /// [`Duration`](std::time::Duration).
-    ///
-    /// If the [`Listener`] instance has already been notified then this method will
-    /// return immediately. The return value indicates whether a notification was
-    /// consumed, returning `None` in the case of a timeout.
-    pub fn wait(&mut self, timeout: impl Expiry) -> Result<Option<bool>, LockError> {
-        unsafe { self.inner.to_ref() }
-            .parker
-            .park(timeout.into_opt_instant())
     }
 }
 

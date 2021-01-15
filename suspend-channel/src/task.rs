@@ -1,16 +1,22 @@
 //! Wrap a function and a channel in a single heap allocation, allowing
 //! for async polling of the result.
 
+extern crate alloc;
+
+use alloc::boxed::Box;
 use core::{
     cell::UnsafeCell,
     future::Future,
     marker::PhantomData,
-    mem::{forget, transmute, ManuallyDrop},
+    mem::{forget, transmute},
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll},
 };
 
+#[cfg(feature = "std")]
+use core::mem::ManuallyDrop;
+#[cfg(feature = "std")]
 use suspend_core::Expiry;
 
 use crate::{channel::Channel, RecvError};
@@ -43,7 +49,7 @@ impl<T, F> TaskInner<T, F> {
         let slf = &*(addr as *const Self);
         slf.body.get().drop_in_place();
         slf.body.get().write(None);
-        if slf.header.channel.drop_one_side(false) {
+        if slf.header.channel.drop_one_side(true) {
             Self::drop_task(addr);
         }
     }
@@ -109,6 +115,7 @@ pub struct JoinTask<'t, T> {
 
 impl<'t, T> JoinTask<'t, T> {
     /// Block the current thread on the result of the task
+    #[cfg(feature = "std")]
     pub fn join(self) -> TaskResult<T> {
         if let Some(task) = ManuallyDrop::new(self).task {
             let task = unsafe { &*task.as_ptr() };
@@ -123,15 +130,18 @@ impl<'t, T> JoinTask<'t, T> {
     }
 
     /// Block the current thread on the result of the task, with a timeout
-    pub fn join_timeout(&mut self, timeout: impl Expiry) -> TaskResult<T> {
+    #[cfg(feature = "std")]
+    pub fn join_timeout(&mut self, timeout: impl Into<Expiry>) -> TaskResult<T> {
         if let Some(task) = self.task.take() {
-            let (result, dropped) = unsafe { &*task.as_ptr() }
-                .channel
-                .wait_read_timeout(timeout.into_opt_instant());
+            let task_ref = unsafe { &*task.as_ptr() };
+            let (result, dropped) = task_ref.channel.wait_read_timeout(timeout.into());
             if dropped {
-                unsafe { ((&*task.as_ptr()).vtable.drop)(task.as_ptr() as *const ()) };
+                unsafe { (task_ref.vtable.drop)(task.as_ptr() as *const ()) };
                 result.ok_or(RecvError::Incomplete)
             } else if let Some(result) = result {
+                if task_ref.channel.drop_one_side(false) {
+                    unsafe { (task_ref.vtable.drop)(task.as_ptr() as *const ()) };
+                }
                 Ok(result)
             } else {
                 self.task.replace(task);
@@ -139,6 +149,24 @@ impl<'t, T> JoinTask<'t, T> {
             }
         } else {
             Err(RecvError::Terminated)
+        }
+    }
+
+    /// Try to fetch the result of the task
+    pub fn try_join(&mut self) -> Poll<Result<T, RecvError>> {
+        if let Some(task) = self.task.take() {
+            let task_ref = unsafe { &*task.as_ptr() };
+            if let Poll::Ready((result, dropped)) = task_ref.channel.read(None, false) {
+                if dropped || task_ref.channel.drop_one_side(false) {
+                    unsafe { (task_ref.vtable.drop)(task.as_ptr() as *const ()) };
+                }
+                Poll::Ready(result.ok_or(RecvError::Incomplete))
+            } else {
+                self.task.replace(task);
+                Poll::Pending
+            }
+        } else {
+            Poll::Ready(Err(RecvError::Terminated))
         }
     }
 }
@@ -181,6 +209,11 @@ unsafe impl<T: Send> Send for JoinTask<'_, T> {}
 
 impl<T> Unpin for JoinTask<'_, T> {}
 
+#[cfg(feature = "std")]
+impl<T> ::std::panic::UnwindSafe for JoinTask<'_, T> {}
+#[cfg(feature = "std")]
+impl<T> ::std::panic::RefUnwindSafe for JoinTask<'_, T> {}
+
 /// A handle for a heap-allocated task
 #[derive(Debug)]
 pub struct TaskFn<'t> {
@@ -209,6 +242,11 @@ impl Drop for TaskFn<'_> {
         unsafe { ((&*addr).cancel)(addr as *const ()) };
     }
 }
+
+#[cfg(feature = "std")]
+impl ::std::panic::UnwindSafe for TaskFn<'_> {}
+#[cfg(feature = "std")]
+impl ::std::panic::RefUnwindSafe for TaskFn<'_> {}
 
 /// Create a new pair of a `TaskFn` and `JoinTask` from a coroutine
 pub fn task_fn<'t, T: 't>(f: impl FnOnce() -> T + Send + 't) -> (TaskFn<'t>, JoinTask<'t, T>) {

@@ -5,7 +5,7 @@ authors = ["Andrew Whitehead <cywolf@gmail.com>"]
 edition = "2018"
 
 [features]
-default = ["jemalloc"]
+default = []
 jemalloc = ["jemallocator"]
 
 [dependencies]

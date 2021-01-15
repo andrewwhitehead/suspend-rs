@@ -11,13 +11,13 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 fn test_send_once_recv() {
     let (sender, receiver) = send_once();
-    sender.send_nowait(1).unwrap();
+    sender.try_send(1).unwrap();
     receiver.recv().unwrap();
 }
 
 fn test_send_once_block_on() {
     let (sender, receiver) = send_once();
-    sender.send_nowait(1).unwrap();
+    sender.try_send(1).unwrap();
     block_on(receiver).unwrap();
 }
 

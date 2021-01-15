@@ -12,9 +12,9 @@ use core::{
     sync::atomic::{AtomicI32, Ordering},
 };
 use libc;
-use std::time::Instant;
 
-use super::{LockError, RawInit, RawParker};
+use super::{LockError, RawParker};
+use crate::types::{Expiry, ParkResult};
 
 const STATE_FREE: i32 = 0b0000;
 const STATE_HELD: i32 = 0b0010;
@@ -45,9 +45,8 @@ fn errno() -> libc::c_int {
 #[repr(transparent)]
 pub struct ParkImpl(AtomicI32);
 
-impl RawInit for ParkImpl {
-    #[inline]
-    fn new() -> Self {
+impl ParkImpl {
+    pub const fn new() -> Self {
         Self(AtomicI32::new(STATE_FREE))
     }
 }
@@ -69,7 +68,7 @@ impl RawParker for ParkImpl {
         Ok(())
     }
 
-    fn park(&self, timeout: Option<Instant>) -> Result<bool, LockError> {
+    fn park(&self, timeout: Expiry) -> Result<Option<bool>, LockError> {
         let futex = &self.0;
 
         // relaxed ordering is suffient, we will check again after acquiring the mutex
@@ -78,7 +77,7 @@ impl RawParker for ParkImpl {
             // consume notification
             let found = futex.swap(state & !STATE_UNPARK, Ordering::Acquire);
             debug_assert_eq!(found, state);
-            return Ok(true);
+            return Ok(Some(false));
         }
 
         let state = match futex.compare_exchange(
@@ -91,7 +90,7 @@ impl RawParker for ParkImpl {
             Err(state) if state & STATE_UNPARK != 0 => {
                 let found = futex.swap(state & !STATE_UNPARK, Ordering::Acquire);
                 debug_assert_eq!(found, state);
-                return Ok(true);
+                return Ok(Some(false));
             }
             _ => panic!("Invalid lock state update"),
         };
@@ -101,7 +100,11 @@ impl RawParker for ParkImpl {
             let state = futex.load(Ordering::Acquire);
             if timed_out || state & STATE_UNPARK != 0 {
                 let found = futex.swap(state & !(STATE_PARK | STATE_UNPARK), Ordering::Acquire);
-                return Ok(found & STATE_UNPARK != 0);
+                return Ok(if found & STATE_UNPARK != 0 {
+                    Some(true)
+                } else {
+                    None
+                });
             }
         }
     }
@@ -127,9 +130,9 @@ impl Debug for ParkImpl {
 }
 
 #[inline]
-fn futex_wait(lock: &AtomicI32, state: i32, timeout: Option<Instant>) -> Result<bool, LockError> {
-    let ts = if let Some(exp) = timeout {
-        if let Some(diff) = exp.checked_duration_since(Instant::now()) {
+fn futex_wait(lock: &AtomicI32, state: i32, timeout: Expiry) -> Result<bool, LockError> {
+    let ts = if timeout.is_some() {
+        if let Some(diff) = timeout.checked_duration() {
             if diff.as_secs() as libc::time_t as u64 != diff.as_secs() {
                 // Timeout overflowed, just sleep indefinitely
                 None

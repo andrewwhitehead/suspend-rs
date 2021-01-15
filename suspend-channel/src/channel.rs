@@ -3,15 +3,20 @@ use core::{
     future::Future,
     marker::PhantomData,
     mem::ManuallyDrop,
+    panic,
     pin::Pin,
     sync::atomic::{AtomicU8, Ordering},
     task::{Context, Poll, Waker},
 };
-use std::panic;
-use std::time::Instant;
+
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
 
 use futures_core::{FusedFuture, FusedStream, Stream};
-use suspend_core::{listen::block_on_poll, util::BoxPtr, Expiry};
+use suspend_core::util::BoxPtr;
+
+#[cfg(feature = "std")]
+use suspend_core::{thread::block_on_poll, Expiry};
 
 use super::error::{RecvError, TrySendError};
 use super::util::Maybe;
@@ -399,6 +404,7 @@ impl<T> Channel<T> {
         }
     }
 
+    #[cfg(feature = "std")]
     pub fn wait_read(&self) -> (Option<T>, bool) {
         // poll once without creating a listener in case the value is ready
         if let Poll::Ready(result) = self.read(None, false) {
@@ -414,7 +420,8 @@ impl<T> Channel<T> {
         }
     }
 
-    pub fn wait_read_timeout(&self, timeout: Option<Instant>) -> (Option<T>, bool) {
+    #[cfg(feature = "std")]
+    pub fn wait_read_timeout(&self, timeout: Expiry) -> (Option<T>, bool) {
         // poll once without creating a listener in case the value is ready
         if let Poll::Ready(result) = self.read(None, false) {
             return result;
@@ -442,7 +449,8 @@ impl<T> Debug for Channel<T> {
     }
 }
 
-impl<T> panic::RefUnwindSafe for Channel<T> {}
+#[cfg(feature = "std")]
+impl<T> ::std::panic::RefUnwindSafe for Channel<T> {}
 
 /// A [`Future`] which resolves once a write has completed.
 #[must_use = "Flush does nothing unless you `.await` or poll it"]
@@ -603,17 +611,14 @@ impl<T> ReceiveOnce<T> {
         })
     }
 
-    /// Try to receive the value, consuming the [`ReceiveOnce`] if the value
-    /// has been loaded or the [`SendOnce`] has been dropped.
+    /// Try to receive the value from the sender.
     #[inline]
-    pub fn try_recv(&mut self) -> Option<Result<T, RecvError>> {
-        match self.poll_result(None) {
-            Poll::Ready(r) => Some(r),
-            Poll::Pending => None,
-        }
+    pub fn try_recv(&mut self) -> Poll<Option<T>> {
+        self.poll_result(None).map(Result::ok)
     }
 
     /// Block the current thread until a value is received or the [`SendOnce`] is dropped.
+    #[cfg(feature = "std")]
     pub fn recv(self) -> Result<T, RecvError> {
         if let Some(channel) = ManuallyDrop::new(self).channel.take() {
             let (result, dropped) = unsafe { channel.to_ref() }.wait_read();
@@ -628,10 +633,10 @@ impl<T> ReceiveOnce<T> {
 
     /// Block the current thread until a value is received or the [`SendOnce`] is dropped,
     /// returning `Err(Self)` if a timeout is reached.
-    pub fn recv_timeout(&mut self, timeout: impl Expiry) -> Result<T, RecvError> {
+    #[cfg(feature = "std")]
+    pub fn recv_timeout(&mut self, timeout: impl Into<Expiry>) -> Result<T, RecvError> {
         if let Some(channel) = self.channel.take() {
-            let (result, dropped) =
-                unsafe { channel.to_ref() }.wait_read_timeout(timeout.into_opt_instant());
+            let (result, dropped) = unsafe { channel.to_ref() }.wait_read_timeout(timeout.into());
             if dropped {
                 unsafe { channel.dealloc() };
                 result.ok_or(RecvError::Incomplete)
@@ -836,6 +841,7 @@ impl<T> Receiver<T> {
 
     /// Block the current thread on the next result from the [`Sender`], returning
     /// [`None`] if the sender has been dropped.
+    #[cfg(feature = "std")]
     pub fn wait_next(&mut self) -> Option<T> {
         if let Some(channel) = self.channel.take() {
             let (result, dropped) = unsafe { channel.to_ref() }.wait_read();
@@ -853,10 +859,10 @@ impl<T> Receiver<T> {
     /// Block the current thread on the next result from the [`Sender`], returning
     /// `Ok(None)`] if the sender has been dropped and `Err(Incomplete)` if the
     /// provided timeout is reached.
-    pub fn wait_next_timeout(&mut self, timeout: impl Expiry) -> Result<T, RecvError> {
+    #[cfg(feature = "std")]
+    pub fn wait_next_timeout(&mut self, timeout: impl Into<Expiry>) -> Result<T, RecvError> {
         if let Some(channel) = self.channel.take() {
-            let (result, dropped) =
-                unsafe { channel.to_ref() }.wait_read_timeout(timeout.into_opt_instant());
+            let (result, dropped) = unsafe { channel.to_ref() }.wait_read_timeout(timeout.into());
             if dropped {
                 unsafe { channel.dealloc() };
                 result.ok_or(RecvError::Incomplete)

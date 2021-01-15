@@ -8,11 +8,10 @@ use core::{
     ops::Deref,
     sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
 };
-use std::time::Instant;
 
 use crate::{
     error::LockError,
-    raw_lock::{NativeParker, RawInit, RawParker},
+    raw_park::{NativeParker, RawParker},
     types::Expiry,
     util::BoxPtr,
 };
@@ -76,13 +75,13 @@ impl<T> Shared<T> {
     }
 
     /// Wait for all outstanding borrows to be dropped, with an optional expiry
-    pub fn collect(&mut self, timeout: impl Expiry) -> Result<bool, LockError> {
-        unsafe { self.inner.to_ref() }.collect(timeout.into_opt_instant())
+    pub fn collect(&mut self, timeout: impl Into<Expiry>) -> Result<bool, LockError> {
+        unsafe { self.inner.to_ref() }.collect(timeout.into())
     }
 
     /// Wait for all outstanding borrows to be dropped and unwrap the `Shared<T>`
     pub fn collect_into(self) -> Result<T, LockError> {
-        unsafe { self.inner.to_ref() }.collect(None)?;
+        unsafe { self.inner.to_ref() }.collect(None.into())?;
         let inner = ManuallyDrop::new(self).inner;
         Ok(unsafe { inner.into_box().into_inner() })
     }
@@ -118,8 +117,7 @@ impl<T> SharedInner<T> {
         BoxPtr::alloc(Self::new(value))
     }
 
-    #[inline]
-    pub fn new(value: T) -> Self {
+    pub const fn new(value: T) -> Self {
         Self {
             count: AtomicUsize::new(3),
             parker: NativeParker::new(),
@@ -186,7 +184,7 @@ impl<T> SharedInner<T> {
         }
     }
 
-    pub fn collect(&self, timeout: Option<Instant>) -> Result<bool, LockError> {
+    pub fn collect(&self, timeout: Expiry) -> Result<bool, LockError> {
         // be sure to synchronize with the last dropped ref
         let mut count = self.count.load(Ordering::Acquire);
         if count == 3 {
@@ -204,7 +202,7 @@ impl<T> SharedInner<T> {
             return Ok(true);
         }
         'outer: while count != 1 {
-            if !self.parker.park(timeout)? {
+            if self.parker.park(timeout)?.timed_out() {
                 if self.count.load(Ordering::Acquire) == 2 {
                     panic!("should have unparked");
                 }
@@ -258,8 +256,6 @@ impl<T> SharedInner<T> {
 pub struct SharedRef<T> {
     inner: BoxPtr<SharedInner<T>>,
 }
-
-unsafe impl<T: Send> Send for SharedRef<T> {}
 
 impl<T> SharedRef<T> {
     pub(crate) fn new(inner: BoxPtr<SharedInner<T>>) -> Self {
@@ -315,8 +311,6 @@ pub struct Ref<'s, T> {
     inner: BoxPtr<SharedInner<T>>,
     _marker: PhantomData<&'s ()>,
 }
-
-unsafe impl<T: Send> Send for Ref<'_, T> {}
 
 impl<T> Ref<'_, T> {
     /// Get the current number of borrows, including this one
@@ -392,14 +386,15 @@ impl<T> PinShared<T> {
         unsafe { self.inner.into_inner() }
     }
 }
-
 struct CollectOnDrop<'s, T>(&'s SharedInner<T>);
 
 impl<T> Drop for CollectOnDrop<'_, T> {
     fn drop(&mut self) {
-        self.0.collect(None).unwrap();
+        self.0.collect(None.into()).unwrap();
     }
 }
+
+// unsafe impl<T: Send> Send for CollectOnDrop<'_, T> {}
 
 /// A tracking value which notifies its source when dropped
 #[derive(Debug)]
@@ -408,11 +403,11 @@ pub struct ScopedRef<T> {
 }
 
 unsafe impl<T: Send> Send for ScopedRef<T> {}
-unsafe impl<T: Send> Sync for ScopedRef<T> {}
+unsafe impl<T: Sync> Sync for ScopedRef<T> {}
 
 impl<T> ScopedRef<T> {
     #[inline]
-    pub(crate) fn new(inner: *const SharedInner<T>) -> Self {
+    pub(crate) fn new(inner: &SharedInner<T>) -> Self {
         unsafe { SharedInner::inc_count_ref(inner) };
         ScopedRef { inner }
     }
@@ -426,7 +421,9 @@ impl<T> ScopedRef<T> {
 
 impl<T> Clone for ScopedRef<T> {
     fn clone(&self) -> Self {
-        Self::new(self.inner)
+        let inner = self.inner;
+        unsafe { SharedInner::inc_count_ref(inner) };
+        Self { inner }
     }
 }
 

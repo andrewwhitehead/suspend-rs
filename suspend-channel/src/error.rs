@@ -1,5 +1,4 @@
-use std::error::Error;
-use std::fmt::{self, Display, Formatter};
+use core::fmt::{self, Display, Formatter};
 
 /// An error indicating that a receive operation could not be completed
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -29,7 +28,8 @@ impl Display for RecvError {
     }
 }
 
-impl Error for RecvError {}
+#[cfg(feature = "std")]
+impl ::std::error::Error for RecvError {}
 
 /// An error indicating that a `try_send` operation could not be completed
 #[derive(Debug, PartialEq, Eq, Hash)]

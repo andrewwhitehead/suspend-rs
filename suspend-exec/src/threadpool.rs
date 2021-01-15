@@ -4,13 +4,16 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
-use std::{collections::VecDeque, marker::PhantomData, panic, thread};
+use std::{
+    collections::VecDeque,
+    marker::PhantomData,
+    panic,
+    sync::{Condvar, Mutex, MutexGuard},
+    thread,
+};
 
 use suspend_channel::task::{task_fn, JoinTask, TaskFn, TaskResult};
-use suspend_core::{
-    lock::{Lock, LockGuard},
-    shared::{PinShared, Ref, ScopedRef, Shared, SharedRef},
-};
+use suspend_core::shared::{PinShared, Ref, ScopedRef, Shared, SharedRef};
 use tracing::info;
 
 static DEFAULT_THREAD_NAME: &'static str = "threadpool";
@@ -67,13 +70,14 @@ impl ThreadPool {
     pub fn new(config: ThreadPoolConfig) -> Self {
         let slf = Self {
             inner: Shared::new(ThreadPoolInner {
-                state: Lock::new(ThreadPoolState {
+                state: Mutex::new(ThreadPoolState {
                     idle_count: 0,
                     panic_count: 0,
                     thread_count: 0,
                     queue: VecDeque::new(),
                     shutdown: false,
                 }),
+                state_cvar: Condvar::new(),
                 idle_timeout: config.idle_timeout,
                 thread_min_count: config.min_count,
                 thread_max_count: config.max_count,
@@ -99,7 +103,6 @@ impl ThreadPool {
         slf
     }
 
-    // TODO: add join
     // TODO: set stack size
 
     pub fn run<F, T>(&self, f: F) -> JoinTask<'static, T>
@@ -167,7 +170,7 @@ impl Drop for ThreadPool {
         drop(state);
 
         // notify any waiting threads to discover shutdown state
-        self.inner.state.notify_all();
+        self.inner.state_cvar.notify_all();
 
         // block until all references have been dropped (all threads have exited)
         self.inner.collect(None).unwrap();
@@ -183,7 +186,8 @@ impl From<ThreadPoolConfig> for ThreadPool {
 }
 
 struct ThreadPoolInner {
-    state: Lock<ThreadPoolState>,
+    state: Mutex<ThreadPoolState>,
+    state_cvar: Condvar,
     idle_timeout: Option<Duration>,
     thread_min_count: usize,
     thread_max_count: Option<usize>,
@@ -207,7 +211,7 @@ impl ThreadPoolInner {
         let mut state = inner.state.lock().unwrap();
         state.queue.push_back(task);
         if !ThreadPoolInner::maybe_spawn(inner, state) {
-            inner.state.notify_one();
+            inner.state_cvar.notify_one();
         }
     }
 
@@ -240,14 +244,15 @@ impl ThreadPoolInner {
                     break;
                 }
             } else if let Some(timeout) = inner.idle_timeout {
-                let (guard, timed_out) = state.wait(timeout).unwrap();
+                let (guard, timeout_result) =
+                    inner.state_cvar.wait_timeout(state, timeout).unwrap();
                 state = guard;
-                if timed_out && state.thread_count > inner.thread_min_count {
+                if timeout_result.timed_out() && state.thread_count > inner.thread_min_count {
                     info!("worker thread timed out");
                     break;
                 }
             } else {
-                state = state.wait(None).unwrap().0;
+                state = inner.state_cvar.wait(state).unwrap();
             }
         }
 
@@ -266,7 +271,7 @@ impl ThreadPoolInner {
         }
     }
 
-    fn maybe_spawn(inner: Ref<'_, Self>, mut state: LockGuard<'_, ThreadPoolState>) -> bool {
+    fn maybe_spawn(inner: Ref<'_, Self>, mut state: MutexGuard<'_, ThreadPoolState>) -> bool {
         let idle_count = state.idle_count;
         if idle_count == 0 || idle_count * 5 < state.queue.len() {
             let thread_count = state.thread_count;
@@ -281,7 +286,7 @@ impl ThreadPoolInner {
                 drop(state);
 
                 let builder = inner.build_thread();
-                inner.state.notify_all();
+                inner.state_cvar.notify_all();
                 builder
                     .spawn({
                         let inner = inner.borrow();

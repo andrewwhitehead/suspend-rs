@@ -7,11 +7,6 @@ use std::sync::{
 };
 use std::task::{Context, Poll, Waker};
 
-pub fn run_test<T>(test: impl FnOnce() -> T) -> T {
-    tracing_subscriber::fmt::try_init().ok();
-    test()
-}
-
 #[derive(Default, Debug)]
 pub struct State {
     calls: AtomicUsize,
