@@ -111,9 +111,10 @@ impl<'t, T> JoinTask<'t, T> {
     /// Block the current thread on the result of the task
     pub fn join(self) -> TaskResult<T> {
         if let Some(task) = ManuallyDrop::new(self).task {
-            let (result, dropped) = unsafe { &*task.as_ptr() }.channel.wait_read();
-            if dropped {
-                unsafe { ((&*task.as_ptr()).vtable.drop)(task.as_ptr() as *const ()) };
+            let task = unsafe { &*task.as_ptr() };
+            let (result, dropped) = task.channel.wait_read();
+            if dropped || task.channel.drop_one_side(false) {
+                unsafe { (task.vtable.drop)(task as *const TaskHeader<T> as *const ()) };
             }
             result.ok_or(RecvError::Incomplete)
         } else {

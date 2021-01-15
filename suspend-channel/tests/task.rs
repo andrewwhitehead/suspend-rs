@@ -1,3 +1,5 @@
+use std::panic;
+use std::thread;
 use std::time::Duration;
 
 use suspend_channel::{task::task_fn, RecvError};
@@ -42,6 +44,7 @@ fn task_fn_join_block_on() {
     assert_eq!(block_on(join), Ok(true));
 }
 
+#[cfg(not(miri))]
 #[test]
 fn task_fn_join_timeout() {
     let (task, mut join) = task_fn(|| true);
@@ -60,4 +63,14 @@ fn task_fn_join_timeout() {
 #[test]
 fn task_fn_both_drop() {
     task_fn(|| true);
+}
+
+#[test]
+fn task_fn_panic() {
+    let (task, join) = task_fn(move || {
+        panic!("expected");
+    });
+    let result = thread::spawn(|| task.run());
+    assert_eq!(join.join(), Err(RecvError::Incomplete));
+    result.join().expect_err("Expected a panic");
 }
