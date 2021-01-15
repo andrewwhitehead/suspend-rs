@@ -11,7 +11,7 @@ use std::time::Duration;
 use futures_core::FusedFuture;
 use futures_task::{waker_ref, ArcWake};
 
-use suspend_channel::{send_once, RecvError, StreamIterExt};
+use suspend_channel::{send_once, RecvError, StreamIterExt, TrySendError};
 use suspend_core::listen::block_on;
 
 mod utils;
@@ -48,7 +48,7 @@ fn send_once_receive_poll() {
     let mut cx = Context::from_waker(&wr);
     assert_eq!(Pin::new(&mut receiver).poll(&mut cx), Poll::Pending);
     assert_eq!(waker.count(), 0);
-    assert_eq!(sender.send_nowait(message), Ok(()));
+    assert_eq!(sender.try_send(message), Ok(()));
     assert_eq!(waker.count(), 1);
     assert_eq!(receiver.is_terminated(), false);
     assert_eq!(drops.count(), 0);
@@ -74,14 +74,14 @@ fn send_once_receive_poll() {
 #[test]
 fn send_once_receive_block_on() {
     let (sender, receiver) = send_once();
-    assert_eq!(sender.send_nowait(1u32), Ok(()));
+    assert_eq!(sender.try_send(1u32), Ok(()));
     assert_eq!(block_on(receiver), Ok(1u32));
 }
 
 #[test]
 fn send_once_receive_wait() {
     let (sender, receiver) = send_once();
-    assert_eq!(sender.send_nowait(1u32), Ok(()));
+    assert_eq!(sender.try_send(1u32), Ok(()));
     assert_eq!(receiver.recv(), Ok(1u32));
 }
 
@@ -92,7 +92,7 @@ fn send_once_receive_wait_timeout() {
         receiver.recv_timeout(Duration::from_millis(50)),
         Err(RecvError::TimedOut)
     );
-    assert_eq!(sender.send_nowait(1u32), Ok(()));
+    assert_eq!(sender.try_send(1u32), Ok(()));
     assert_eq!(receiver.recv_timeout(Duration::from_millis(50)), Ok(1u32));
     assert_eq!(
         receiver.recv_timeout(Duration::from_millis(50)),
@@ -104,8 +104,8 @@ fn send_once_receive_wait_timeout() {
 fn send_once_threaded() {
     let (sender0, receiver0) = send_once();
     let (sender1, receiver1) = send_once();
-    thread::spawn(move || sender1.send_nowait(block_on(receiver0).unwrap()).unwrap());
-    thread::spawn(move || sender0.send_nowait(1u32).unwrap());
+    thread::spawn(move || sender1.try_send(block_on(receiver0).unwrap()).unwrap());
+    thread::spawn(move || sender0.try_send(1u32).unwrap());
     assert_eq!(block_on(receiver1), Ok(1u32));
 }
 
@@ -129,14 +129,14 @@ fn send_once_sender_dropped() {
 fn send_once_receiver_dropped_early() {
     let (sender, receiver) = send_once();
     drop(receiver);
-    assert_eq!(sender.send_nowait(1u32), Err(1u32));
+    assert_eq!(sender.try_send(1u32), Err(TrySendError::Disconnected(1u32)));
 }
 
 #[test]
 fn send_once_receiver_dropped_incomplete() {
     let (sender, receiver) = send_once();
     let (message, drops) = TestDrop::new_pair();
-    sender.send_nowait(message).unwrap();
+    sender.try_send(message).unwrap();
     assert_eq!(drops.count(), 0);
     //assert!(block_on(receiver).is_ok());
     drop(receiver);
@@ -147,7 +147,7 @@ fn send_once_receiver_dropped_incomplete() {
 fn send_once_receiver_dropped_complete() {
     let (sender, receiver) = send_once();
     let (message, drops) = TestDrop::new_pair();
-    sender.send_nowait(message).unwrap();
+    sender.try_send(message).unwrap();
     let result = block_on(receiver).unwrap();
     assert_eq!(drops.count(), 0);
     drop(result);
@@ -157,7 +157,7 @@ fn send_once_receiver_dropped_complete() {
 #[test]
 fn send_once_receiver_stream_one() {
     let (sender, mut receiver) = send_once::<u32>();
-    sender.send_nowait(5).unwrap();
+    sender.try_send(5).unwrap();
     assert_eq!(receiver.is_terminated(), false);
     assert_eq!(block_on(receiver.stream_next()), Some(5));
     assert_eq!(receiver.is_terminated(), true);
@@ -178,13 +178,13 @@ fn send_once_receiver_stream_empty() {
 fn send_once_receiver_cancel_early() {
     let (sender, receiver) = send_once::<u32>();
     assert_eq!(receiver.cancel(), None);
-    assert!(sender.send_nowait(5).is_err());
+    assert!(sender.try_send(5).is_err());
 }
 
 #[test]
 fn send_once_receiver_cancel_late() {
     let (sender, receiver) = send_once::<u32>();
-    sender.send_nowait(5).unwrap();
+    sender.try_send(5).unwrap();
     assert_eq!(receiver.cancel(), Some(5));
 }
 

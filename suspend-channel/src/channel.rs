@@ -13,7 +13,7 @@ use std::time::Instant;
 use futures_core::{FusedFuture, FusedStream, Stream};
 use suspend_core::{listen::block_on_poll, util::BoxPtr, Expiry};
 
-use super::error::RecvError;
+use super::error::{RecvError, TrySendError};
 use super::util::Maybe;
 
 const STATE_DONE: u8 = 0b00000;
@@ -68,15 +68,20 @@ impl<T> Channel<T> {
         self.state.load(Ordering::Relaxed) & (STATE_ACTIVE | STATE_LOADED) == 0
     }
 
-    pub fn write(&self, value: T, mut waker: Option<&Waker>, finalize: bool) -> Result<(), T> {
+    pub fn write(
+        &self,
+        value: T,
+        mut waker: Option<&Waker>,
+        finalize: bool,
+    ) -> Result<(), (T, bool)> {
         let state = self.state.load(Ordering::Relaxed);
         if state & STATE_ACTIVE == 0 {
             // synchronize with the reader's drop
             self.state.load(Ordering::Acquire);
-            return Err(value);
+            return Err((value, true));
         }
         if state & STATE_LOADED != 0 {
-            panic!("Invalid send to loaded channel");
+            return Err((value, false));
         }
         unsafe { self.value.store(value) };
 
@@ -124,7 +129,7 @@ impl<T> Channel<T> {
                         waker.wake_by_ref();
                         return Ok(());
                     } else if s & STATE_ACTIVE == 0 {
-                        return Err(unsafe { self.value.load() });
+                        return Err((unsafe { self.value.load() }, true));
                     } else {
                         panic!("Invalid channel state {}", s);
                     }
@@ -133,7 +138,7 @@ impl<T> Channel<T> {
                 let remove = STATE_WLOCK | STATE_WAKE | (finalize as u8 * STATE_ACTIVE);
                 prev = self.state.fetch_and(!remove, Ordering::Release);
                 if prev & STATE_ACTIVE == 0 {
-                    return Err(unsafe { self.value.load() });
+                    return Err((unsafe { self.value.load() }, true));
                 }
             }
             read_waker.map(Waker::wake);
@@ -466,18 +471,24 @@ impl<T> Drop for Flush<'_, T> {
 }
 
 impl<T> Future for Flush<'_, T> {
-    type Output = Result<(), T>;
+    type Output = Result<(), TrySendError<T>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(value) = self.value.take() {
             let channel = self.channel.take().unwrap();
-            if let Err(value) =
+            if let Err((value, dropped)) =
                 unsafe { channel.to_ref() }.write(value, Some(cx.waker()), self.finalize)
             {
-                if self.finalize {
+                if self.finalize && dropped {
                     unsafe { channel.dealloc() };
+                } else {
+                    self.channel.replace(channel);
                 }
-                Poll::Ready(Err(value))
+                Poll::Ready(Err(if dropped {
+                    TrySendError::Disconnected(value)
+                } else {
+                    TrySendError::Full(value)
+                }))
             } else {
                 self.channel.replace(channel);
                 Poll::Pending
@@ -486,10 +497,16 @@ impl<T> Future for Flush<'_, T> {
             if let Poll::Ready((result, dropped)) =
                 unsafe { channel.to_ref() }.flush(cx.waker(), self.finalize)
             {
-                if dropped && self.finalize {
+                if self.finalize && dropped {
                     unsafe { channel.dealloc() };
+                } else {
+                    self.channel.replace(channel);
                 }
-                Poll::Ready(result.map(Err).unwrap_or(Ok(())))
+                Poll::Ready(
+                    result
+                        .map(|v| Err(TrySendError::Disconnected(v)))
+                        .unwrap_or(Ok(())),
+                )
             } else {
                 self.channel.replace(channel);
                 Poll::Pending
@@ -523,17 +540,6 @@ impl<T> SendOnce<T> {
         unsafe { self.channel.to_ref() }.is_done()
     }
 
-    /// Dispatch the result and consume the [`SendOnce`].
-    pub fn send_nowait(self, value: T) -> Result<(), T> {
-        let channel = ManuallyDrop::new(self).channel;
-        unsafe { channel.to_ref() }
-            .write(value, None, true)
-            .map_err(|value| {
-                unsafe { channel.dealloc() };
-                value
-            })
-    }
-
     /// Load a value to be sent, returning a [`Future`] which resolves when
     /// the value is received or the [`ReceiveOnce`] is dropped.
     #[inline]
@@ -544,6 +550,21 @@ impl<T> SendOnce<T> {
             finalize: true,
             _marker: PhantomData,
         }
+    }
+
+    /// Try to dispatch the result and consume the [`SendOnce`].
+    pub fn try_send(self, value: T) -> Result<(), TrySendError<T>> {
+        let channel = ManuallyDrop::new(self).channel;
+        unsafe { channel.to_ref() }
+            .write(value, None, true)
+            .map_err(|(value, dropped)| {
+                unsafe { channel.dealloc() };
+                if dropped {
+                    TrySendError::Disconnected(value)
+                } else {
+                    TrySendError::Full(value)
+                }
+            })
     }
 }
 
@@ -596,7 +617,7 @@ impl<T> ReceiveOnce<T> {
     pub fn recv(self) -> Result<T, RecvError> {
         if let Some(channel) = ManuallyDrop::new(self).channel.take() {
             let (result, dropped) = unsafe { channel.to_ref() }.wait_read();
-            if dropped {
+            if dropped || unsafe { channel.to_ref() }.drop_one_side(false) {
                 unsafe { channel.dealloc() };
             }
             result.ok_or(RecvError::Incomplete)
@@ -615,6 +636,9 @@ impl<T> ReceiveOnce<T> {
                 unsafe { channel.dealloc() };
                 result.ok_or(RecvError::Incomplete)
             } else if let Some(result) = result {
+                if unsafe { channel.to_ref() }.drop_one_side(false) {
+                    unsafe { channel.dealloc() };
+                }
                 Ok(result)
             } else {
                 self.channel.replace(channel);
@@ -713,20 +737,6 @@ impl<T> Sender<T> {
             .unwrap_or(true)
     }
 
-    /// Send a single result and consume the [`Sender`].
-    pub fn send_nowait(self, value: T) -> Result<(), T> {
-        if let Some(channel) = ManuallyDrop::new(self).channel {
-            unsafe { channel.to_ref() }
-                .write(value, None, true)
-                .map_err(|value| {
-                    unsafe { channel.dealloc() };
-                    value
-                })
-        } else {
-            Err(value)
-        }
-    }
-
     /// Send the next result, returning a `Future` which can be used to await
     /// its delivery.
     #[inline]
@@ -736,6 +746,32 @@ impl<T> Sender<T> {
             value: Some(value),
             finalize: false,
             _marker: PhantomData,
+        }
+    }
+
+    /// Try to send the next message
+    pub fn try_send(&mut self, value: T) -> Result<(), TrySendError<T>> {
+        if let Some(channel) = self.channel.take() {
+            match unsafe { channel.to_ref() }.write(value, None, false) {
+                Ok(()) => {
+                    self.channel.replace(channel);
+                    Ok(())
+                }
+                Err((value, dropped)) => {
+                    if dropped {
+                        unsafe { channel.dealloc() };
+                    } else {
+                        self.channel.replace(channel);
+                    }
+                    Err(if dropped {
+                        TrySendError::Disconnected(value)
+                    } else {
+                        TrySendError::Full(value)
+                    })
+                }
+            }
+        } else {
+            Err(TrySendError::Disconnected(value))
         }
     }
 }

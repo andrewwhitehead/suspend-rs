@@ -53,7 +53,7 @@ fn empty_stream() {
     assert!(ran);
 }
 
-// #[cfg(not(miri))]
+#[cfg(not(miri))]
 #[test]
 fn nest_stream() {
     let s = stream! {

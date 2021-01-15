@@ -9,7 +9,7 @@ use std::thread;
 use futures_core::{FusedStream, Stream};
 use futures_task::{waker_ref, ArcWake};
 
-use suspend_channel::{channel, StreamIterExt};
+use suspend_channel::{channel, StreamIterExt, TrySendError};
 use suspend_core::listen::block_on;
 
 mod utils;
@@ -39,14 +39,14 @@ impl ArcWake for TestWaker {
 
 #[test]
 fn channel_send_receive_poll() {
-    let (sender, mut receiver) = channel();
+    let (mut sender, mut receiver) = channel();
     let (message, drops) = TestDrop::new_pair();
     let waker = Arc::new(TestWaker::new());
     let wr = waker_ref(&waker);
     let mut cx = Context::from_waker(&wr);
     assert_eq!(Pin::new(&mut receiver).poll_next(&mut cx), Poll::Pending);
     assert_eq!(waker.count(), 0);
-    assert_eq!(sender.send_nowait(message), Ok(()));
+    assert_eq!(sender.try_send(message), Ok(()));
     assert_eq!(waker.count(), 1);
     assert_eq!(receiver.is_terminated(), false);
     assert_eq!(drops.count(), 0);
@@ -55,13 +55,16 @@ fn channel_send_receive_poll() {
         drop(result);
         assert_eq!(drops.count(), 1);
         assert_eq!(waker.count(), 1);
+        assert_eq!(receiver.is_terminated(), false);
+        assert_eq!(Pin::new(&mut receiver).poll_next(&mut cx), Poll::Pending);
+        assert_eq!(waker.count(), 1);
+        assert_eq!(drops.count(), 1);
+        drop(sender);
         assert_eq!(receiver.is_terminated(), true);
         assert_eq!(
             Pin::new(&mut receiver).poll_next(&mut cx),
             Poll::Ready(None)
         );
-        assert_eq!(waker.count(), 1);
-        assert_eq!(drops.count(), 1);
         drop(receiver);
         assert_eq!(drops.count(), 1);
     } else {
@@ -71,36 +74,36 @@ fn channel_send_receive_poll() {
 
 #[test]
 fn channel_send_receive_block_on() {
-    let (sender, mut receiver) = channel();
-    assert_eq!(sender.send_nowait(1u32), Ok(()));
+    let (mut sender, mut receiver) = channel();
+    assert_eq!(sender.try_send(1u32), Ok(()));
     assert_eq!(block_on(receiver.stream_next()), Some(1u32));
 }
 
 #[test]
 fn channel_send_receive_wait_next() {
-    let (sender, mut receiver) = channel();
-    assert_eq!(sender.send_nowait(1u32), Ok(()));
+    let (mut sender, mut receiver) = channel();
+    assert_eq!(sender.try_send(1u32), Ok(()));
     assert_eq!(receiver.wait_next(), Some(1u32));
 }
 
 #[test]
 fn channel_send_receive_thread() {
-    let (sender, mut receiver) = channel();
-    let ta = thread::spawn(move || sender.send_nowait(1u32).unwrap());
+    let (mut sender, mut receiver) = channel();
+    let ta = thread::spawn(move || sender.try_send(1u32).unwrap());
     assert_eq!(block_on(receiver.stream_next()), Some(1u32));
     ta.join().unwrap();
 }
 
 #[test]
 fn channel_send_receive_forward_thread() {
-    let (sender0, mut receiver0) = channel();
-    let (sender1, mut receiver1) = channel();
+    let (mut sender0, mut receiver0) = channel();
+    let (mut sender1, mut receiver1) = channel();
     let ta = thread::spawn(move || {
         sender1
-            .send_nowait(block_on(receiver0.stream_next()).unwrap())
+            .try_send(block_on(receiver0.stream_next()).unwrap())
             .unwrap()
     });
-    let tb = thread::spawn(move || sender0.send_nowait(1u32).unwrap());
+    let tb = thread::spawn(move || sender0.try_send(1u32).unwrap());
     assert_eq!(block_on(receiver1.stream_next()), Some(1u32));
     ta.join().unwrap();
     tb.join().unwrap();
@@ -110,7 +113,7 @@ fn channel_send_receive_forward_thread() {
 fn channel_send_receive_thread_multiple() {
     let (mut sender, receiver) = channel::<i32>();
     let ops = thread::spawn(move || {
-        for idx in 0..1000 {
+        for idx in 0..100 {
             assert_eq!(block_on(sender.send(idx)), Ok(()));
         }
     });
@@ -140,27 +143,29 @@ fn channel_sender_dropped() {
 
 #[test]
 fn channel_receiver_dropped_early() {
-    let (sender, receiver) = channel();
+    let (mut sender, receiver) = channel();
     drop(receiver);
-    assert_eq!(sender.send_nowait(1u32), Err(1u32));
+    assert_eq!(sender.try_send(1u32), Err(TrySendError::Disconnected(1u32)));
 }
 
 #[test]
 fn channel_receiver_dropped_incomplete() {
-    let (sender, receiver) = channel();
+    let (mut sender, receiver) = channel();
     let (message, drops) = TestDrop::new_pair();
-    sender.send_nowait(message).unwrap();
+    sender.try_send(message).unwrap();
     assert_eq!(drops.count(), 0);
     //assert!(receiver.wait().is_ok());
     drop(receiver);
+    assert_eq!(drops.count(), 0);
+    drop(sender);
     assert_eq!(drops.count(), 1);
 }
 
 #[test]
 fn channel_receiver_dropped_complete() {
-    let (sender, mut receiver) = channel();
+    let (mut sender, mut receiver) = channel();
     let (message, drops) = TestDrop::new_pair();
-    sender.send_nowait(message).unwrap();
+    sender.try_send(message).unwrap();
     let result = block_on(receiver.stream_next()).unwrap();
     assert_eq!(drops.count(), 0);
     drop(result);
@@ -171,24 +176,26 @@ fn channel_receiver_dropped_complete() {
 
 #[test]
 fn channel_receiver_block_on() {
-    let (sender, mut receiver) = channel::<u32>();
-    sender.send_nowait(5).unwrap();
+    let (mut sender, mut receiver) = channel::<u32>();
+    sender.try_send(5).unwrap();
     assert_eq!(block_on(receiver.stream_next()), Some(5));
 }
 
 #[test]
 fn channel_receiver_wait_next() {
-    let (sender, mut receiver) = channel::<u32>();
-    sender.send_nowait(5).unwrap();
+    let (mut sender, mut receiver) = channel::<u32>();
+    sender.try_send(5).unwrap();
     assert_eq!(receiver.wait_next(), Some(5));
 }
 
 #[test]
 fn channel_receiver_stream_one() {
-    let (sender, mut receiver) = channel::<u32>();
-    sender.send_nowait(5).unwrap();
+    let (mut sender, mut receiver) = channel::<u32>();
+    sender.try_send(5).unwrap();
     assert_eq!(receiver.is_terminated(), false);
     assert_eq!(block_on(receiver.stream_next()), Some(5));
+    assert_eq!(receiver.is_terminated(), false);
+    drop(sender);
     assert_eq!(receiver.is_terminated(), true);
     assert_eq!(block_on(receiver.stream_next()), None);
     assert_eq!(receiver.is_terminated(), true);
@@ -205,14 +212,14 @@ fn channel_receiver_stream_empty() {
 
 #[test]
 fn channel_receiver_cancel_early() {
-    let (sender, receiver) = channel::<u32>();
+    let (mut sender, receiver) = channel::<u32>();
     assert_eq!(receiver.cancel(), None);
-    assert!(sender.send_nowait(5).is_err());
+    assert!(sender.try_send(5).is_err());
 }
 
 #[test]
 fn channel_receiver_cancel_late() {
-    let (sender, receiver) = channel::<u32>();
-    sender.send_nowait(5).unwrap();
+    let (mut sender, receiver) = channel::<u32>();
+    sender.try_send(5).unwrap();
     assert_eq!(receiver.cancel(), Some(5));
 }

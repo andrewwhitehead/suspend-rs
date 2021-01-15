@@ -4,7 +4,7 @@
 
 pub use self::{
     channel::{channel, send_once, Flush, ReceiveOnce, Receiver, SendOnce, Sender},
-    error::RecvError,
+    error::{RecvError, TrySendError},
     util::{StreamIter, StreamIterExt, StreamIterMut, StreamNextMut},
 };
 
