@@ -3,7 +3,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use futures_channel::oneshot as futures_oneshot;
 use oneshot_rs as oneshot;
 use suspend_channel::send_once;
-use suspend_core::listen::block_on;
+use suspend_core::thread::block_on;
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]

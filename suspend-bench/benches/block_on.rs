@@ -15,7 +15,7 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 fn listen_block_on_ready() {
     assert_eq!(
-        suspend_core::listen::block_on(futures_lite::future::ready(true)),
+        suspend_core::thread::block_on(futures_lite::future::ready(true)),
         true
     )
 }
@@ -71,7 +71,7 @@ impl<T> Future for Repoll<T> {
 
 fn listen_block_on_repoll() {
     assert_eq!(
-        suspend_core::listen::block_on(Repoll::new(true, 1, true)),
+        suspend_core::thread::block_on(Repoll::new(true, 1, true)),
         true
     )
 }
