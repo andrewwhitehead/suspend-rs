@@ -2,19 +2,21 @@
 //! all outstanding borrows to be dropped.
 
 use core::{
+    borrow::Borrow,
+    cell::UnsafeCell,
+    fmt::{self, Debug, Formatter},
     future::Future,
     marker::PhantomData,
-    mem::ManuallyDrop,
+    mem::MaybeUninit,
     ops::Deref,
-    sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
+    pin::Pin,
+    sync::atomic::{fence, AtomicUsize, Ordering},
+    task::{Context, Poll, Waker},
 };
 
-use crate::{
-    error::LockError,
-    raw_park::{NativeParker, RawParker},
-    types::Expiry,
-    util::BoxPtr,
-};
+use futures_core::future::FusedFuture;
+
+use crate::{thread::block_on_poll, util::BoxPtr, Expiry};
 
 /// Run a function and then block the current thread until all trackers
 /// produced by the function have been dropped. This can be used to
@@ -41,28 +43,47 @@ where
 /// A shared value which can be borrowed by multiple threads and later
 /// collected
 #[derive(Debug)]
-pub struct Shared<T> {
+pub struct Lender<T> {
     inner: BoxPtr<SharedInner<T>>,
+    pending: bool,
 }
 
-impl<T> Shared<T> {
-    /// Construct a new `Shared<T>` instance
+impl<T> Lender<T> {
+    /// Construct a new `Lender<T>` instance
     #[inline]
     pub fn new(value: T) -> Self {
         Self {
             inner: SharedInner::boxed(value),
+            pending: false,
         }
+    }
+
+    /// Obtain a mutable reference to the contained resource if there
+    /// are no outstanding borrows
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        if self.try_collect() {
+            Some(unsafe { self.get_mut_unchecked() })
+        } else {
+            None
+        }
+    }
+
+    /// Obtain a mutable reference to the contained resource
+    #[inline]
+    pub unsafe fn get_mut_unchecked(&mut self) -> &mut T {
+        &mut (&mut *(self.inner.to_ptr() as *mut SharedInner<T>)).value
     }
 
     /// Create a new shared reference to the contained value
     #[inline]
-    pub fn borrow(&self) -> SharedRef<T> {
-        SharedRef::new(self.inner)
+    pub fn borrow(&self) -> Shared<T> {
+        Shared::new(self.inner)
     }
 
-    /// Create a temporary reference without increasing the borrow count
-    pub const fn scoped_ref(&self) -> Ref<'_, T> {
-        Ref {
+    /// Create a new shared reference to the contained value
+    #[inline]
+    pub fn borrow_ref(&self) -> SharedRef<'_, T> {
+        SharedRef {
             inner: self.inner,
             _marker: PhantomData,
         }
@@ -75,43 +96,82 @@ impl<T> Shared<T> {
     }
 
     /// Wait for all outstanding borrows to be dropped, with an optional expiry
-    pub fn collect(&mut self, timeout: impl Into<Expiry>) -> Result<bool, LockError> {
-        unsafe { self.inner.to_ref() }.collect(timeout.into())
+    pub fn collect(&mut self) -> Collect<'_, T> {
+        Collect(Some(self))
     }
 
-    /// Wait for all outstanding borrows to be dropped and unwrap the `Shared<T>`
-    pub fn collect_into(self) -> Result<T, LockError> {
-        unsafe { self.inner.to_ref() }.collect(None.into())?;
-        let inner = ManuallyDrop::new(self).inner;
-        Ok(unsafe { inner.into_box().into_inner() })
+    /// Obtain an owned copy of the lent resource
+    pub fn to_owned(&self) -> T
+    where
+        T: Clone,
+    {
+        self.as_ref().clone()
     }
-}
 
-impl<T> Deref for Shared<T> {
-    type Target = T;
+    // /// Wait for all outstanding borrows to be dropped and unwrap the `Shared<T>`
+    // pub fn collect_into(self) -> Result<T, LockError> {
+    //     unsafe { self.inner.to_ref() }.collect(None.into())?;
+    //     let inner = ManuallyDrop::new(self).inner;
+    //     Ok(unsafe { inner.into_box().into_inner() })
+    // }
 
-    #[inline]
-    fn deref(&self) -> &T {
-        &unsafe { self.inner.to_ref() }.value
+    fn poll_collect(&mut self, waker: &Waker) -> Poll<()> {
+        let result = if self.pending {
+            unsafe { self.inner.to_ref() }.resume_poll(waker)
+        } else {
+            unsafe { self.inner.to_ref() }.start_poll(waker)
+        };
+        self.pending = result.is_pending();
+        result
     }
-}
 
-impl<T> Drop for Shared<T> {
-    fn drop(&mut self) {
-        unsafe {
-            SharedInner::drop_shared(self.inner);
+    fn try_collect(&mut self) -> bool {
+        if unsafe { self.inner.to_ref() }.try_collect(self.pending) {
+            self.pending = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cancel_collect(&mut self) {
+        if self.pending {
+            unsafe { self.inner.to_ref() }.cancel_poll(true);
         }
     }
 }
 
-#[derive(Debug)]
+impl<T> AsRef<T> for Lender<T> {
+    #[inline]
+    fn as_ref(&self) -> &T {
+        &unsafe { self.inner.to_ref() }.value
+    }
+}
+
+impl<T> Borrow<T> for Lender<T> {
+    #[inline]
+    fn borrow(&self) -> &T {
+        &unsafe { self.inner.to_ref() }.value
+    }
+}
+
+impl<T> Drop for Lender<T> {
+    fn drop(&mut self) {
+        unsafe {
+            SharedInner::drop_lender(self.inner, self.pending);
+        }
+    }
+}
+
 pub(crate) struct SharedInner<T> {
     count: AtomicUsize,
-    parker: NativeParker,
+    waker: UnsafeCell<MaybeUninit<Waker>>,
     value: T,
 }
 
 impl<T> SharedInner<T> {
+    const MAX_REFCOUNT: usize = (isize::MAX) as usize;
+
     #[inline]
     pub fn boxed(value: T) -> BoxPtr<Self> {
         BoxPtr::alloc(Self::new(value))
@@ -120,7 +180,7 @@ impl<T> SharedInner<T> {
     pub const fn new(value: T) -> Self {
         Self {
             count: AtomicUsize::new(3),
-            parker: NativeParker::new(),
+            waker: UnsafeCell::new(MaybeUninit::uninit()),
             value,
         }
     }
@@ -128,19 +188,17 @@ impl<T> SharedInner<T> {
     pub unsafe fn into_inner(self) -> T {
         self.value
     }
-}
-
-impl<T> SharedInner<T> {
-    const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 
     #[inline]
     pub fn borrow_count(&self) -> usize {
-        (self.count.load(Ordering::Relaxed) / 2) - 1
+        (self.count.load(Ordering::Relaxed) / 2).saturating_sub(1)
     }
 
     #[inline]
-    pub unsafe fn drop_shared(slf: BoxPtr<Self>) {
-        if slf.to_ref().count.fetch_sub(3, Ordering::Release) == 3 {
+    pub unsafe fn drop_lender(slf: BoxPtr<Self>, pending: bool) {
+        if (pending && slf.to_ref().cancel_poll(false))
+            || slf.to_ref().count.fetch_sub(3, Ordering::Release) == 3
+        {
             fence(Ordering::Acquire);
             slf.dealloc();
         }
@@ -164,15 +222,16 @@ impl<T> SharedInner<T> {
                     fence(Ordering::Acquire);
                     return true;
                 }
-                2 => {
+                1 => {
+                    fence(Ordering::Acquire);
                     // Shared is in collection phase and this was the last reference.
                     // it will wait for us to readjust the count, so that the
                     // allocation is not dropped before we can notify it
-                    inner.parker.unpark();
+                    inner.wake_waker();
                     // inner may have given up waiting, in which case the update will fail
                     if inner
                         .count
-                        .compare_exchange(2, 1, Ordering::Release, Ordering::Relaxed)
+                        .compare_exchange(1, 2, Ordering::Release, Ordering::Relaxed)
                         .is_ok()
                     {
                         return false;
@@ -184,83 +243,227 @@ impl<T> SharedInner<T> {
         }
     }
 
-    pub fn collect(&self, timeout: Expiry) -> Result<bool, LockError> {
-        // be sure to synchronize with the last dropped ref
-        let mut count = self.count.load(Ordering::Acquire);
-        if count == 3 {
-            // only the Shared remains, nothing to do
-            return Ok(true);
-        }
-        // start collection
-        let mut loops = 0;
-        count = self.count.fetch_sub(1, Ordering::Relaxed) - 1;
-        if count == 2 {
-            // last reference was dropped between acquiring and updating the count
-            // use acquire here to synchronize with that drop
-            count = self.count.swap(3, Ordering::Acquire);
-            assert_eq!(count, 2, "Invalid shared state");
-            return Ok(true);
-        }
-        'outer: while count != 1 {
-            if self.parker.park(timeout)?.timed_out() {
-                if self.count.load(Ordering::Acquire) == 2 {
-                    panic!("should have unparked");
-                }
-                return Ok(false);
-            }
+    #[inline]
+    unsafe fn clear_waker(&self) {
+        (&mut *self.waker.get()).as_mut_ptr().drop_in_place();
+    }
 
-            count = self.count.load(Ordering::Acquire);
-            if count == 2 {
-                // last reference was interrupted while notifying us.
-                // rather than relying on thread::yield_now, spin for
-                // a little and then require the ref to notify us again
-                let mut retries = 50;
-                loop {
-                    if retries > 0 {
-                        spin_loop_hint();
-                        count = self.count.load(Ordering::Relaxed);
-                        if count == 1 {
-                            break 'outer;
-                        }
-                        retries -= 1;
-                    } else {
-                        match self.count.compare_exchange(
-                            2,
-                            4,
-                            Ordering::Acquire,
-                            Ordering::Acquire,
-                        ) {
-                            Ok(_) => {
-                                loops += 1;
-                                if loops > 100 {
-                                    panic!("uh oh");
-                                }
-                                break; // park again
+    #[inline]
+    unsafe fn store_waker(&self, waker: &Waker) {
+        self.waker.get().write(MaybeUninit::new(waker.clone()));
+    }
+
+    #[inline]
+    unsafe fn wake_waker(&self) {
+        self.waker.get().read().assume_init().wake();
+    }
+
+    pub fn try_collect(&self, pending: bool) -> bool {
+        // be sure to synchronize with the last dropped ref
+        let count = self.count.load(Ordering::Relaxed);
+        if pending && count == 2 {
+            assert_eq!(2, self.count.swap(3, Ordering::Acquire));
+            true
+        } else if !pending && count == 3 {
+            fence(Ordering::Acquire);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn start_poll(&self, waker: &Waker) -> Poll<()> {
+        let mut count = self.count.load(Ordering::Relaxed);
+        if count == 3 {
+            // be sure to synchronize with the last dropped ref
+            fence(Ordering::Acquire);
+            return Poll::Ready(());
+        }
+
+        unsafe { self.store_waker(waker) };
+
+        count = self.count.fetch_sub(2, Ordering::Release) - 2;
+        if count == 1 {
+            // last reference was dropped between acquiring and updating the count
+            unsafe { self.clear_waker() };
+            // use acquire here to synchronize with the drop
+            count = self.count.swap(3, Ordering::Acquire);
+            assert_eq!(count, 1, "Invalid shared state");
+            return Poll::Ready(());
+        }
+
+        Poll::Pending
+    }
+
+    pub fn resume_poll(&self, waker: &Waker) -> Poll<()> {
+        let mut count = self.count.load(Ordering::Relaxed);
+        loop {
+            match count {
+                2 => {
+                    // last reference has been dropped and waker has been cleared
+                    fence(Ordering::Acquire);
+                    return Poll::Ready(());
+                }
+                1 => {
+                    // last reference was interrupted while notifying us
+                    // yield to let it complete
+                    waker.wake_by_ref();
+                    return Poll::Pending;
+                }
+                _ => {
+                    match self.count.compare_exchange_weak(
+                        count,
+                        count + 2,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            unsafe {
+                                self.clear_waker();
+                                self.store_waker(waker);
                             }
-                            Err(1) => break 'outer,
-                            Err(_) => panic!("Invalid shared state"),
+                            count = self.count.fetch_sub(2, Ordering::Release) - 2;
+                            if count == 2 {
+                                unsafe { self.clear_waker() };
+                            }
+                        }
+                        Err(c) => {
+                            count = c;
                         }
                     }
                 }
             }
         }
-        // end collection
-        count = self.count.swap(3, Ordering::Relaxed);
-        assert_eq!(count, 1, "Invalid shared state");
-        return Ok(true);
+    }
+
+    // returns is-last-reference
+    pub fn cancel_poll(&self, reset: bool) -> bool {
+        let mut count = self.count.load(Ordering::Relaxed);
+        loop {
+            match count {
+                2 => {
+                    // last reference dropped during collection
+                    if reset {
+                        assert_eq!(2, self.count.swap(3, Ordering::Relaxed));
+                    }
+                    return true;
+                }
+                1 => {
+                    // last reference interrupted mid-drop. it will call the
+                    // stored waker and then attempt to change the refcount to
+                    // 2. if that fails, it will retry
+                    match self.count.compare_exchange_weak(
+                        1,
+                        if reset { 5 } else { 2 },
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            // last reference is now responsible for dropping the allocation
+                            return !reset;
+                        }
+                        Err(c) => {
+                            count = c;
+                        }
+                    }
+                }
+                s => {
+                    // try increase reference count so it is safe to clear the waker
+                    match self.count.compare_exchange_weak(
+                        s,
+                        s + 2,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            // stored waker is now safe to remove
+                            unsafe { self.clear_waker() };
+                            return false;
+                        }
+                        Err(c) => {
+                            count = c;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
+impl<T: Debug> Debug for SharedInner<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedInner")
+            .field("value", &self.value)
+            .finish()
+    }
+}
+
+/// A `Future` which resolves when all outstanding borrows of the `Lender<T>`
+/// have been returned
+#[derive(Debug)]
+pub struct Collect<'c, T>(Option<&'c mut Lender<T>>);
+
+impl<'c, T> Collect<'c, T> {
+    /// Block the current thread on the collection of the shared resource
+    pub fn wait(mut self, timeout: impl Into<Expiry>) -> Result<&'c mut T, &'c mut Lender<T>> {
+        let lender = self
+            .0
+            .take()
+            .expect("Cannot call Collect::wait() after polling");
+        if lender.try_collect() {
+            return Ok(unsafe { lender.get_mut_unchecked() });
+        }
+        match block_on_poll(|cx| lender.poll_collect(cx.waker()), timeout) {
+            Poll::Ready(()) => Ok(unsafe { lender.get_mut_unchecked() }),
+            Poll::Pending => Err(lender),
+        }
+    }
+}
+
+impl<T> Drop for Collect<'_, T> {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            self.0.take().unwrap().cancel_collect();
+        }
+    }
+}
+
+impl<'c, T> Future for Collect<'c, T> {
+    type Output = &'c mut T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(lender) = self.0.take() {
+            match lender.poll_collect(cx.waker()) {
+                Poll::Ready(()) => Poll::Ready(unsafe { lender.get_mut_unchecked() }),
+                Poll::Pending => {
+                    self.0.replace(lender);
+                    Poll::Pending
+                }
+            }
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl<T> FusedFuture for Collect<'_, T> {
+    fn is_terminated(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl<T> Unpin for Collect<'_, T> {}
+
 /// A tracking value which notifies its source when dropped
 #[derive(Debug)]
-pub struct SharedRef<T> {
+pub struct Shared<T> {
     inner: BoxPtr<SharedInner<T>>,
 }
 
-impl<T> SharedRef<T> {
+impl<T> Shared<T> {
     pub(crate) fn new(inner: BoxPtr<SharedInner<T>>) -> Self {
         unsafe { SharedInner::inc_count_ref(inner.to_ptr()) };
-        SharedRef { inner }
+        Shared { inner }
     }
 
     /// Get the current number of borrows, including this one
@@ -270,22 +473,22 @@ impl<T> SharedRef<T> {
     }
 
     /// Create a temporary reference without increasing the borrow count
-    pub const fn scoped_ref(&self) -> Ref<'_, T> {
-        Ref {
+    pub const fn borrow_ref(&self) -> SharedRef<'_, T> {
+        SharedRef {
             inner: self.inner,
             _marker: PhantomData,
         }
     }
 }
 
-impl<T> Clone for SharedRef<T> {
+impl<T> Clone for Shared<T> {
     #[inline]
     fn clone(&self) -> Self {
         Self::new(self.inner)
     }
 }
 
-impl<T> Deref for SharedRef<T> {
+impl<T> Deref for Shared<T> {
     type Target = T;
 
     #[inline]
@@ -294,7 +497,7 @@ impl<T> Deref for SharedRef<T> {
     }
 }
 
-impl<T> Drop for SharedRef<T> {
+impl<T> Drop for Shared<T> {
     fn drop(&mut self) {
         unsafe {
             if SharedInner::dec_count_ref(self.inner.to_ptr()) {
@@ -307,26 +510,26 @@ impl<T> Drop for SharedRef<T> {
 /// A temporary reference to a shared value
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct Ref<'s, T> {
+pub struct SharedRef<'s, T> {
     inner: BoxPtr<SharedInner<T>>,
     _marker: PhantomData<&'s ()>,
 }
 
-impl<T> Ref<'_, T> {
+impl<T> SharedRef<'_, T> {
     /// Get the current number of borrows, including this one
     #[inline]
     pub fn borrow_count(&self) -> usize {
         unsafe { self.inner.to_ref() }.borrow_count()
     }
 
-    /// Construct a new `SharedRef<T>` for the associated `Shared<T>`
+    /// Construct a new `Shared<T>` for the associated `Shared<T>`
     #[inline]
-    pub fn borrow(&self) -> SharedRef<T> {
-        SharedRef::new(self.inner)
+    pub fn into_shared(self) -> Shared<T> {
+        Shared::new(self.inner)
     }
 }
 
-impl<T> Clone for Ref<'_, T> {
+impl<T> Clone for SharedRef<'_, T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner,
@@ -334,9 +537,9 @@ impl<T> Clone for Ref<'_, T> {
         }
     }
 }
-impl<T> Copy for Ref<'_, T> {}
+impl<T> Copy for SharedRef<'_, T> {}
 
-impl<T> Deref for Ref<'_, T> {
+impl<T> Deref for SharedRef<'_, T> {
     type Target = T;
 
     #[inline]
@@ -390,7 +593,20 @@ struct CollectOnDrop<'s, T>(&'s SharedInner<T>);
 
 impl<T> Drop for CollectOnDrop<'_, T> {
     fn drop(&mut self) {
-        self.0.collect(None.into()).unwrap();
+        if !self.0.try_collect(false) {
+            let mut first = true;
+            let _ = block_on_poll(
+                |cx| {
+                    if first {
+                        first = false;
+                        self.0.start_poll(cx.waker())
+                    } else {
+                        self.0.resume_poll(cx.waker())
+                    }
+                },
+                None,
+            );
+        }
     }
 }
 

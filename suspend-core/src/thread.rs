@@ -70,12 +70,15 @@ pub fn block_on_poll<'s, T>(
 /// Block the current thread on the result of a [`Future`] + [`Unpin`], with an
 /// optional timeout. A [`None`] value is returned if the timeout is reached.
 #[inline]
-pub fn block_on_unpin<'s, T>(
-    mut fut: impl Future<Output = T> + Unpin,
-    timeout: impl Into<Expiry>,
-) -> Poll<T> {
+pub fn block_on_unpin<'s, F, T>(mut fut: F, timeout: impl Into<Expiry>) -> Result<T, F>
+where
+    F: Future<Output = T> + Unpin,
+{
     let timeout = timeout.into();
-    block_on_poll(|cx| Pin::new(&mut fut).poll(cx), timeout)
+    match block_on_poll(|cx| Pin::new(&mut fut).poll(cx), timeout) {
+        Poll::Ready(r) => Ok(r),
+        Poll::Pending => Err(fut),
+    }
 }
 
 /// Park the current thread until notified, with an optional timeout.
@@ -91,7 +94,7 @@ pub fn park_thread<'s>(f: impl FnOnce(Notifier), timeout: impl Into<Expiry>) -> 
     })
 }
 
-fn with_listener<T>(f: impl FnOnce(&mut ListenerGuard<'_>, &Waker) -> T) -> T {
+pub(crate) fn with_listener<T>(f: impl FnOnce(&mut ListenerGuard<'_>, &Waker) -> T) -> T {
     THREAD_LISTEN.with(|cached| {
         if let Ok(mut borrowed) = cached.try_borrow_mut() {
             let (listen, waker) = &mut *borrowed;
