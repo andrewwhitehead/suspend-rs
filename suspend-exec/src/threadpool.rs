@@ -1,23 +1,24 @@
 use core::{
     any::Any,
+    marker::PhantomData,
     mem,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 use std::{
     collections::VecDeque,
-    marker::PhantomData,
     panic,
     sync::{Condvar, Mutex, MutexGuard},
     thread,
 };
 
-use suspend_channel::task::{task_fn, JoinTask, TaskFn, TaskResult};
-use suspend_core::shared::{PinShared, Ref, ScopedRef, Shared, SharedRef};
+use suspend_channel::task::{task_fn, JoinTask, TaskFn};
+use suspend_core::shared::{Lender, PinShared, ScopedRef, Shared, SharedRef};
 use tracing::info;
 
 static DEFAULT_THREAD_NAME: &'static str = "threadpool";
 
+// TODO: set stack size
 pub struct ThreadPoolConfig {
     idle_timeout: Option<Duration>,
     min_count: usize,
@@ -63,13 +64,13 @@ impl Default for ThreadPoolConfig {
 }
 
 pub struct ThreadPool {
-    inner: Shared<ThreadPoolInner>,
+    inner: Lender<ThreadPoolInner>,
 }
 
 impl ThreadPool {
     pub fn new(config: ThreadPoolConfig) -> Self {
         let slf = Self {
-            inner: Shared::new(ThreadPoolInner {
+            inner: Lender::new(ThreadPoolInner {
                 state: Mutex::new(ThreadPoolState {
                     idle_count: 0,
                     panic_count: 0,
@@ -86,12 +87,13 @@ impl ThreadPool {
             }),
         };
         if config.min_count > 0 {
-            let mut state = slf.inner.state.lock().unwrap();
+            let mut state = slf.inner.as_ref().state.lock().unwrap();
             for _ in 0..(config.min_count) {
                 info!("pre-start");
                 state.idle_count += 1;
                 state.thread_count += 1;
                 slf.inner
+                    .as_ref()
                     .build_thread()
                     .spawn({
                         let inner = slf.inner.borrow();
@@ -103,15 +105,13 @@ impl ThreadPool {
         slf
     }
 
-    // TODO: set stack size
-
     pub fn run<F, T>(&self, f: F) -> JoinTask<'static, T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
         let (task, join) = task_fn(f);
-        ThreadPoolInner::run_boxed(self.inner.scoped_ref(), task);
+        ThreadPoolInner::run_boxed(self.inner.borrow_ref(), task);
         join
     }
 
@@ -126,24 +126,6 @@ impl ThreadPool {
         let mut share = PinShared::new(self.inner.borrow());
         share.with(|s| f(Scope::new(s)))
     }
-
-    pub async fn async_scoped<'s, F, T>(&'s self, f: F) -> TaskResult<T>
-    where
-        F: FnOnce(Scope<'s>) -> T + Send + 's,
-        T: Send + 's,
-    {
-        let mut share = PinShared::new(self.inner.borrow());
-        share
-            .async_with(|s| {
-                let (runnable, join) = task_fn({
-                    let s = s.clone();
-                    move || f(Scope::new(s))
-                });
-                ThreadPoolInner::run_boxed(s.scoped_ref(), unsafe { mem::transmute(runnable) });
-                join
-            })
-            .await
-    }
 }
 
 impl Default for ThreadPool {
@@ -157,23 +139,20 @@ impl Drop for ThreadPool {
         if thread::panicking() {
             return;
         }
+        let inner = self.inner.as_ref();
 
         // change pool status and notify any waiting threads
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("Error locking threadpool mutex");
+        let mut state = inner.state.lock().expect("Error locking threadpool mutex");
 
         info!("drop pool inner");
         state.shutdown = true;
         drop(state);
 
         // notify any waiting threads to discover shutdown state
-        self.inner.state_cvar.notify_all();
+        inner.state_cvar.notify_all();
 
         // block until all references have been dropped (all threads have exited)
-        self.inner.collect(None).unwrap();
+        self.inner.collect().wait(None).unwrap();
 
         info!("dropped pool");
     }
@@ -185,6 +164,7 @@ impl From<ThreadPoolConfig> for ThreadPool {
     }
 }
 
+#[derive(Debug)]
 struct ThreadPoolInner {
     state: Mutex<ThreadPoolState>,
     state_cvar: Condvar,
@@ -207,7 +187,7 @@ impl ThreadPoolInner {
         thread::Builder::new().name(name)
     }
 
-    fn run_boxed(inner: Ref<'_, Self>, task: TaskFn<'static>) {
+    fn run_boxed(inner: SharedRef<'_, Self>, task: TaskFn<'static>) {
         let mut state = inner.state.lock().unwrap();
         state.queue.push_back(task);
         if !ThreadPoolInner::maybe_spawn(inner, state) {
@@ -215,7 +195,7 @@ impl ThreadPoolInner {
         }
     }
 
-    fn run_thread(inner: SharedRef<Self>) {
+    fn run_thread(inner: Shared<Self>) {
         info!("start worker thread");
         let mut tasks = 0usize;
         let mut state = inner.state.lock().unwrap();
@@ -228,7 +208,7 @@ impl ThreadPoolInner {
 
             if let Some(task) = state.queue.pop_front() {
                 state.idle_count -= 1;
-                Self::maybe_spawn(inner.scoped_ref(), state);
+                Self::maybe_spawn(inner.borrow_ref(), state);
 
                 tasks += 1;
                 if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| task.run())) {
@@ -271,7 +251,7 @@ impl ThreadPoolInner {
         }
     }
 
-    fn maybe_spawn(inner: Ref<'_, Self>, mut state: MutexGuard<'_, ThreadPoolState>) -> bool {
+    fn maybe_spawn(inner: SharedRef<'_, Self>, mut state: MutexGuard<'_, ThreadPoolState>) -> bool {
         let idle_count = state.idle_count;
         if idle_count == 0 || idle_count * 5 < state.queue.len() {
             let thread_count = state.thread_count;
@@ -289,7 +269,7 @@ impl ThreadPoolInner {
                 inner.state_cvar.notify_all();
                 builder
                     .spawn({
-                        let inner = inner.borrow();
+                        let inner = inner.into_shared();
                         move || Self::run_thread(inner)
                     })
                     .unwrap();
@@ -300,6 +280,7 @@ impl ThreadPoolInner {
     }
 }
 
+#[derive(Debug)]
 struct ThreadPoolState {
     idle_count: usize,
     panic_count: usize,
@@ -308,22 +289,24 @@ struct ThreadPoolState {
     shutdown: bool,
 }
 
+#[derive(Debug)]
 pub struct Scope<'s> {
-    inner: ScopedRef<SharedRef<ThreadPoolInner>>,
+    inner: ScopedRef<Shared<ThreadPoolInner>>,
     _marker: PhantomData<&'s mut &'s ()>,
 }
 
 impl<'s> Scope<'s> {
     #[inline]
-    fn new(inner: ScopedRef<SharedRef<ThreadPoolInner>>) -> Self {
+    fn new(inner: ScopedRef<Shared<ThreadPoolInner>>) -> Self {
         Self {
             inner,
             _marker: PhantomData,
         }
     }
 
-    // TODO: method to fetch number of running threads for the scope?
-    // method to await completion with a timeout?
+    pub fn pending_count(&self) -> usize {
+        self.inner.borrow_count()
+    }
 
     pub fn run<'t, F, T>(&'t self, f: F) -> JoinTask<'t, T>
     where
@@ -335,7 +318,7 @@ impl<'s> Scope<'s> {
             move || f(scope)
         });
         ThreadPoolInner::run_boxed(
-            self.inner.scoped_ref(),
+            self.inner.borrow_ref(),
             // make the task 'static - we promise to collect any references
             unsafe { mem::transmute(runnable) },
         );

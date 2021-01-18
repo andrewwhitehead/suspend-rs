@@ -228,10 +228,9 @@ impl TaskFn<'_> {
     /// and the paired `JoinTask` will receive `Err(RecvError::Incomplete)`.
     #[inline]
     pub fn run(self) {
-        let addr = self.task.as_ptr();
         // a panic in the wrapped closure will automatically return
         // RecvError::Incomplete to the JoinTask and drop the allocation
-        forget(self);
+        let addr = ManuallyDrop::new(self).task.as_ptr();
         unsafe { ((&*addr).invoke)(addr as *const ()) };
     }
 }

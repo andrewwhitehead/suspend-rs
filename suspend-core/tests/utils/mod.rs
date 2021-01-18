@@ -3,7 +3,7 @@ use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -85,57 +85,6 @@ impl Deref for Effect {
     }
 }
 
-pub fn notify_pair() -> (Notify, Wait) {
-    let inner = Arc::new(NotifyInner {
-        state: Mutex::new((None, false)),
-    });
-    (
-        Notify {
-            inner: inner.clone(),
-        },
-        Wait { inner },
-    )
-}
-
-pub struct Notify {
-    inner: Arc<NotifyInner>,
-}
-
-impl Notify {
-    pub fn notify(self) {
-        let mut guard = self.inner.state.lock().unwrap();
-        if !guard.1 {
-            guard.1 = true;
-            if let Some(waker) = guard.0.take() {
-                waker.wake();
-            }
-        }
-    }
-}
-
-pub struct Wait {
-    inner: Arc<NotifyInner>,
-}
-
-impl Future for Wait {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut guard = self.inner.state.lock().unwrap();
-        if guard.1 {
-            Poll::Ready(())
-        } else {
-            guard.0.replace(cx.waker().clone());
-            Poll::Pending
-        }
-    }
-}
-
-struct NotifyInner {
-    // use an AtomicWaker if you want to do this normally
-    state: Mutex<(Option<Waker>, bool)>,
-}
-
 pub struct NullWaker;
 
 pub fn waker_noop(_data: *const ()) {}
@@ -163,26 +112,3 @@ where
     let mut cx = Context::from_waker(&waker);
     Pin::new(&mut fut).poll(&mut cx)
 }
-
-pub struct Repoll(usize);
-
-impl Repoll {
-    pub fn new() -> Self {
-        Self(1)
-    }
-}
-
-impl Future for Repoll {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.0 > 0 {
-            self.0 -= 1;
-            Poll::Pending
-        } else {
-            Poll::Ready(())
-        }
-    }
-}
-
-impl Unpin for Repoll {}

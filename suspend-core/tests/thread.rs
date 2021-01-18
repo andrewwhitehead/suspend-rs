@@ -18,7 +18,7 @@ fn park_thread_basic() {
             Duration::from_millis(100)
         )
         .timed_out(),
-        true
+        false
     );
 }
 

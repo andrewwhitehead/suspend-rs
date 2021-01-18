@@ -2,12 +2,9 @@ use core::time::Duration;
 use std::task::Poll;
 use std::thread;
 
-use suspend_core::{
-    pin,
-    shared::{with_scope, Lender, PinShared},
-};
+use suspend_core::shared::{with_scope, Lender, PinShared};
 
-use self::utils::{poll_once, Repoll, Track};
+use self::utils::{poll_once, Track};
 
 mod utils;
 
@@ -107,40 +104,47 @@ fn lender_borrow_collect_threaded() {
     }
 }
 
+#[test]
+fn pin_shared_unused() {
+    let mut shared = PinShared::new(());
+    shared.with(|_| {});
+    assert_eq!(shared.into_inner(), ());
+}
+
+#[test]
+fn pin_shared_borrow() {
+    let mut shared = PinShared::new(());
+    shared.with(|scope| {
+        drop(scope.clone());
+    });
+    assert_eq!(shared.into_inner(), ());
+}
+
 #[cfg(feature = "std")]
 #[test]
-fn pin_shared_async_poll_and_drop() {
+fn pin_shared_threaded() {
     // test that dropping the future after the task is queued
     // functions as expected
     let (track, effect) = Track::new_pair();
-    let mut scope = PinShared::new(());
-    let fut = scope.async_with(|_scope| async move {
+    let mut shared = PinShared::new(());
+    shared.with(|scope| {
         track.call();
-        let th = thread::spawn({
+        thread::spawn({
+            let scope = scope.clone();
+            let track = track.clone();
             move || {
-                // FIXME - breaks in miri without isolation disabled
-                thread::sleep(Duration::from_millis(500));
+                track.call();
+                drop(scope);
             }
-        });
-        track.call();
-        // ensure we return Pending - this is the end of the first poll
-        Repoll::new().await;
-        th.join().unwrap();
+        })
+        .join()
+        .unwrap();
         track.call();
     });
-    // poll once to queue the fn, then drop the future.
-    // this should block until the closure completes
-    {
-        pin!(fut);
-        assert_eq!(poll_once(fut), Poll::Pending);
-        // should have spawned the thread and started waiting
-        assert_eq!(effect.call_count(), 2);
-        // fut will now be dropped
-    }
     // the third call should not be executed because the future was dropped
-    assert_eq!(effect.call_count(), 2);
-    // track is owned by the future
+    assert_eq!(effect.call_count(), 3);
     assert_eq!(effect.drop_count(), 1);
+    assert_eq!(shared.into_inner(), ());
 }
 
 #[test]
@@ -161,6 +165,7 @@ fn with_scope_borrow() {
     );
 }
 
+#[cfg(feature = "std")]
 #[test]
 fn with_scope_borrow_threaded() {
     assert_eq!(

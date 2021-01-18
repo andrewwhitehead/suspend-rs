@@ -29,17 +29,6 @@ where
     scope.with(f)
 }
 
-/// Create a `Future` that collects all trackers from the scope when it
-/// is dropped.
-pub async fn scoped_future<'s, F, Fut, R>(f: F) -> R
-where
-    F: FnOnce(ScopedRef<()>) -> Fut,
-    Fut: Future<Output = R>,
-{
-    let mut scope = PinShared::new(());
-    scope.async_with(f).await
-}
-
 /// A shared value which can be borrowed by multiple threads and later
 /// collected
 #[derive(Debug)]
@@ -398,6 +387,8 @@ impl<T: Debug> Debug for SharedInner<T> {
     }
 }
 
+unsafe impl<T> Sync for SharedInner<T> {}
+
 /// A `Future` which resolves when all outstanding borrows of the `Lender<T>`
 /// have been returned
 #[derive(Debug)]
@@ -560,19 +551,6 @@ impl<T> PinShared<T> {
         Self {
             inner: SharedInner::new(data),
         }
-    }
-
-    /// Evaluate a `Future` in the context of the shared value. Any borrows
-    /// of the value must be returned before the future will resolve,
-    /// and will block the current thread if the future is dropped after
-    /// being polled
-    pub async fn async_with<'s, F, Fut, R>(&'s mut self, f: F) -> R
-    where
-        F: FnOnce(ScopedRef<T>) -> Fut + 's,
-        Fut: Future<Output = R> + 's,
-    {
-        let _collect = CollectOnDrop(&self.inner);
-        f(ScopedRef::new(&self.inner)).await
     }
 
     /// Evaluate a function in the context of the shared value. This method will

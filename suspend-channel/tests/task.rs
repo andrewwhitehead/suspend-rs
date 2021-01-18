@@ -65,8 +65,18 @@ fn task_fn_both_drop() {
     task_fn(|| true);
 }
 
+#[cfg(feature = "std")]
 #[test]
-fn task_fn_panic() {
+fn task_fn_threaded() {
+    let (task, join) = task_fn(move || true);
+    let result = thread::spawn(move || task.run());
+    assert_eq!(join.join(), Ok(true), "Task should complete successfully");
+    result.join().expect("Error joining thread");
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn task_fn_threaded_panic() {
     let (task, join) = task_fn(move || {
         panic!("expected");
     });

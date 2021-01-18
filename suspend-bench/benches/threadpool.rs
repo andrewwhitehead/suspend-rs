@@ -2,7 +2,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 
 use blocking;
 use once_cell::sync::Lazy;
-use suspend_core::listen::block_on;
+use suspend_core::thread::block_on;
 use suspend_exec::ThreadPool;
 
 #[cfg(feature = "jemalloc")]
@@ -31,11 +31,6 @@ fn thread_pool_scoped_run() {
     });
 }
 
-fn thread_pool_async_scoped() {
-    static POOL: Lazy<ThreadPool> = Lazy::new(ThreadPool::default);
-    assert_eq!(block_on(POOL.async_scoped(|_scope| true)).unwrap(), true);
-}
-
 fn blocking_unblock() {
     assert_eq!(block_on(blocking::unblock(move || true)), true);
 }
@@ -52,9 +47,6 @@ fn bench_many(c: &mut Criterion) {
     });
     c.bench_function("thread_pool_scoped_run", |b| {
         b.iter(|| thread_pool_scoped_run());
-    });
-    c.bench_function("thread_pool_async_scoped", |b| {
-        b.iter(|| thread_pool_async_scoped());
     });
     c.bench_function("blocking_unblock", |b| {
         b.iter(|| blocking_unblock());

@@ -408,12 +408,12 @@ impl<T> Channel<T> {
     pub fn wait_read(&self) -> (Option<T>, bool) {
         // poll once without creating a listener in case the value is ready
         if let Poll::Ready(result) = self.read(None, false) {
-            result
+            if result.0.is_some() || result.1 {
+                return result;
+            }
         }
         // poll with a listener
-        else if let Poll::Ready(result) =
-            block_on_poll(|cx| self.read(Some(cx.waker()), false), None)
-        {
+        if let Poll::Ready(result) = block_on_poll(|cx| self.read(Some(cx.waker()), false), None) {
             result
         } else {
             unreachable!()
