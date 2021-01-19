@@ -1,6 +1,7 @@
-use std::panic;
-use std::thread;
-use std::time::Duration;
+use core::task::Poll;
+
+#[cfg(feature = "std")]
+use std::{panic, thread, time::Duration};
 
 use suspend_channel::{task::task_fn, RecvError};
 use suspend_core::thread::block_on;
@@ -11,22 +12,22 @@ mod utils;
 
 #[test]
 fn task_fn_basic() {
-    let (task, join) = task_fn(|| true);
+    let (task, mut join) = task_fn(|| true);
     task.run();
-    assert_eq!(join.join(), Ok(true));
+    assert_eq!(join.try_join(), Poll::Ready(Ok(true)));
 }
 
 #[test]
 fn task_fn_drop() {
     let (track, drops) = TestDrop::new_pair();
-    let (task, join) = task_fn(|| {
+    let (task, mut join) = task_fn(|| {
         drop(track);
         true
     });
     assert_eq!(drops.count(), 0);
     drop(task);
     assert_eq!(drops.count(), 1);
-    assert_eq!(join.join(), Err(RecvError::Incomplete));
+    assert_eq!(join.try_join(), Poll::Ready(Err(RecvError::Incomplete)));
     assert_eq!(drops.count(), 1);
 }
 
@@ -44,7 +45,7 @@ fn task_fn_join_block_on() {
     assert_eq!(block_on(join), Ok(true));
 }
 
-#[cfg(not(miri))]
+#[cfg(all(feature = "std", not(miri)))]
 #[test]
 fn task_fn_join_timeout() {
     let (task, mut join) = task_fn(|| true);
@@ -63,6 +64,15 @@ fn task_fn_join_timeout() {
 #[test]
 fn task_fn_both_drop() {
     task_fn(|| true);
+}
+
+#[test]
+#[should_panic(expected = "expected")]
+fn task_fn_panic() {
+    let (task, _join) = task_fn(move || {
+        panic!("expected");
+    });
+    task.run();
 }
 
 #[cfg(feature = "std")]

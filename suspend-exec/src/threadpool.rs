@@ -1,7 +1,7 @@
 use core::{
     any::Any,
     marker::PhantomData,
-    mem,
+    mem, ptr,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
@@ -13,7 +13,10 @@ use std::{
 };
 
 use suspend_channel::task::{task_fn, JoinTask, TaskFn};
-use suspend_core::shared::{Lender, PinShared, ScopedRef, Shared, SharedRef};
+use suspend_core::{
+    scoped::{PinShared, Scoped},
+    shared::{Lender, Shared, SharedRef},
+};
 use tracing::info;
 
 static DEFAULT_THREAD_NAME: &'static str = "threadpool";
@@ -76,7 +79,7 @@ impl ThreadPool {
                     panic_count: 0,
                     thread_count: 0,
                     queue: VecDeque::new(),
-                    shutdown: false,
+                    phase: ThreadPoolPhase::Active,
                 }),
                 state_cvar: Condvar::new(),
                 idle_timeout: config.idle_timeout,
@@ -126,6 +129,16 @@ impl ThreadPool {
         let mut share = PinShared::new(self.inner.borrow());
         share.with(|s| f(Scope::new(s)))
     }
+
+    pub fn drain(mut self) {
+        self.inner.as_ref().start_drain(false);
+
+        // block until all references have been dropped (all threads have exited)
+        // FIXME return Result<(), ShutdownError>
+        self.inner.collect().wait(None).unwrap();
+
+        unsafe { ptr::drop_in_place(&mut mem::ManuallyDrop::new(self).inner) };
+    }
 }
 
 impl Default for ThreadPool {
@@ -139,17 +152,7 @@ impl Drop for ThreadPool {
         if thread::panicking() {
             return;
         }
-        let inner = self.inner.as_ref();
-
-        // change pool status and notify any waiting threads
-        let mut state = inner.state.lock().expect("Error locking threadpool mutex");
-
-        info!("drop pool inner");
-        state.shutdown = true;
-        drop(state);
-
-        // notify any waiting threads to discover shutdown state
-        inner.state_cvar.notify_all();
+        self.inner.as_ref().start_drain(true);
 
         // block until all references have been dropped (all threads have exited)
         self.inner.collect().wait(None).unwrap();
@@ -202,7 +205,7 @@ impl ThreadPoolInner {
         let mut panic_err: Option<Box<dyn Any + Send + 'static>> = None;
 
         loop {
-            if state.shutdown {
+            if state.phase == ThreadPoolPhase::Shutdown {
                 break;
             }
 
@@ -223,6 +226,8 @@ impl ThreadPoolInner {
                     state.panic_count += 1;
                     break;
                 }
+            } else if state.phase == ThreadPoolPhase::Drain {
+                break;
             } else if let Some(timeout) = inner.idle_timeout {
                 let (guard, timeout_result) =
                     inner.state_cvar.wait_timeout(state, timeout).unwrap();
@@ -278,6 +283,22 @@ impl ThreadPoolInner {
         }
         false
     }
+
+    fn start_drain(&self, shutdown: bool) {
+        // change pool status and notify any waiting threads
+        let mut state = self.state.lock().expect("Error locking threadpool mutex");
+
+        info!("collect pool inner");
+        state.phase = if shutdown {
+            ThreadPoolPhase::Shutdown
+        } else {
+            ThreadPoolPhase::Drain
+        };
+        drop(state);
+
+        // notify any waiting threads to discover drain state
+        self.state_cvar.notify_all();
+    }
 }
 
 #[derive(Debug)]
@@ -286,18 +307,25 @@ struct ThreadPoolState {
     panic_count: usize,
     thread_count: usize,
     queue: VecDeque<TaskFn<'static>>,
-    shutdown: bool,
+    phase: ThreadPoolPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadPoolPhase {
+    Active,
+    Drain,
+    Shutdown,
 }
 
 #[derive(Debug)]
 pub struct Scope<'s> {
-    inner: ScopedRef<Shared<ThreadPoolInner>>,
+    inner: Scoped<Shared<ThreadPoolInner>>,
     _marker: PhantomData<&'s mut &'s ()>,
 }
 
 impl<'s> Scope<'s> {
     #[inline]
-    fn new(inner: ScopedRef<Shared<ThreadPoolInner>>) -> Self {
+    fn new(inner: Scoped<Shared<ThreadPoolInner>>) -> Self {
         Self {
             inner,
             _marker: PhantomData,

@@ -88,5 +88,12 @@ impl<T: Debug + ?Sized> Debug for BoxPtr<T> {
     }
 }
 
+impl<T: ?Sized> PartialEq for BoxPtr<T> {
+    fn eq(&self, other: &BoxPtr<T>) -> bool {
+        self.0 == other.0
+    }
+}
+impl<T: ?Sized> Eq for BoxPtr<T> {}
+
 unsafe impl<T: Send + ?Sized> Send for BoxPtr<T> {}
 unsafe impl<T: Sync + ?Sized> Sync for BoxPtr<T> {}

@@ -8,14 +8,12 @@ use core::{
     cell::UnsafeCell,
     future::Future,
     marker::PhantomData,
-    mem::{forget, transmute},
+    mem::{forget, transmute, ManuallyDrop},
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll},
 };
 
-#[cfg(feature = "std")]
-use core::mem::ManuallyDrop;
 #[cfg(feature = "std")]
 use suspend_core::Expiry;
 

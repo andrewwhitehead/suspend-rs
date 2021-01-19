@@ -1,5 +1,4 @@
 use std::panic;
-use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -40,64 +39,41 @@ fn run_test<T>(test: impl FnOnce() -> T) -> T {
 // }
 
 #[test]
-fn thread_pool_unbounded() {
+fn thread_pool_unbounded_drain() {
     run_test(|| {
         let pool = ThreadPool::default();
-        let count = 100;
-        let cvar = Arc::new(Condvar::new());
-        let mutex = Mutex::new(());
+        let count = 1000;
         let track = Track::new();
         for _ in 0..count {
-            // FIXME collect results instead of using mutex/cvar
             pool.run({
-                let cvar = cvar.clone();
                 let track = track.clone();
                 move || {
-                    thread::sleep(Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(2));
                     track.call();
-                    drop(track);
-                    cvar.notify_one();
                 }
             });
         }
-        let mut guard = mutex.lock().unwrap();
-        loop {
-            if track.call_count() == count {
-                break;
-            }
-            guard = cvar.wait(guard).unwrap();
-        }
+        pool.drain();
         assert_eq!(track.drop_count(), count);
     })
 }
 
 #[test]
-fn thread_pool_bounded() {
+fn thread_pool_bounded_drain() {
     run_test(|| {
         let pool = ThreadPoolConfig::default().max_count(5).build();
-        let count = 100;
-        let cvar = Arc::new(Condvar::new());
-        let mutex = Mutex::new(());
+        let count = 1000;
         let track = Track::new();
         for _ in 0..count {
             pool.run({
-                let cvar = cvar.clone();
                 let track = track.clone();
                 move || {
-                    thread::sleep(Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(2));
                     track.call();
-                    drop(track);
-                    cvar.notify_one();
                 }
             });
         }
-        let mut guard = mutex.lock().unwrap();
-        loop {
-            if track.call_count() == count {
-                break;
-            }
-            guard = cvar.wait(guard).unwrap();
-        }
+        pool.drain();
         assert_eq!(track.drop_count(), count);
     })
 }
@@ -107,6 +83,19 @@ fn thread_pool_run_join() {
     run_test(|| {
         let pool = ThreadPool::default();
         assert_eq!(pool.run(move || { true }).join(), Ok(true))
+    })
+}
+
+#[test]
+fn thread_pool_run_block_on() {
+    run_test(|| {
+        let pool = ThreadPool::default();
+        for i in 0..100 {
+            assert_eq!(
+                block_on(pool.run(move || i)).expect("Error unwrapping run result"),
+                i
+            );
+        }
     })
 }
 
@@ -125,20 +114,23 @@ fn thread_pool_panic_run() {
 }
 
 #[test]
-fn thread_pool_run_async() {
+fn thread_pool_delay_scoped() {
     run_test(|| {
         let pool = ThreadPool::default();
-        for i in 0..100 {
-            assert_eq!(
-                block_on(pool.run(move || i)).expect("Error unwrapping run result"),
-                i
-            );
-        }
+        let (track, _) = Track::new_pair();
+        pool.scoped(|scope| {
+            scope.run(|_| {
+                thread::sleep(Duration::from_millis(50));
+                track.call();
+            });
+        });
+        assert_eq!(track.call_count(), 1);
+        assert_eq!(track.drop_count(), 0);
     })
 }
 
 #[test]
-fn thread_pool_scoped() {
+fn thread_pool_delay_scoped_nested() {
     run_test(|| {
         let pool = ThreadPool::default();
         let (track, _) = Track::new_pair();

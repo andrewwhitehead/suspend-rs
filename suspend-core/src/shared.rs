@@ -7,7 +7,7 @@ use core::{
     fmt::{self, Debug, Formatter},
     future::Future,
     marker::PhantomData,
-    mem::MaybeUninit,
+    mem::{ManuallyDrop, MaybeUninit},
     ops::Deref,
     pin::Pin,
     sync::atomic::{fence, AtomicUsize, Ordering},
@@ -16,18 +16,10 @@ use core::{
 
 use futures_core::future::FusedFuture;
 
-use crate::{thread::block_on_poll, util::BoxPtr, Expiry};
+use crate::util::BoxPtr;
 
-/// Run a function and then block the current thread until all trackers
-/// produced by the function have been dropped. This can be used to
-/// track the completion of spawned threads or futures.
-pub fn with_scope<F, R>(f: F) -> R
-where
-    F: FnOnce(ScopedRef<()>) -> R,
-{
-    let mut scope = PinShared::new(());
-    scope.with(f)
-}
+#[cfg(feature = "std")]
+use crate::{thread::block_on_poll, Expiry};
 
 /// A shared value which can be borrowed by multiple threads and later
 /// collected
@@ -60,7 +52,13 @@ impl<T> Lender<T> {
     /// Obtain a mutable reference to the contained resource
     #[inline]
     pub unsafe fn get_mut_unchecked(&mut self) -> &mut T {
-        &mut (&mut *(self.inner.to_ptr() as *mut SharedInner<T>)).value
+        (&mut *(self.inner.to_ptr() as *mut SharedInner<T>)).as_mut()
+    }
+
+    /// Unwrap the `Lender<T>` when there are no outstanding references
+    #[inline]
+    pub unsafe fn into_inner(self) -> T {
+        self.inner.into_box().into_inner()
     }
 
     /// Create a new shared reference to the contained value
@@ -89,6 +87,11 @@ impl<T> Lender<T> {
         Collect(Some(self))
     }
 
+    /// Wait for all outstanding borrows to be dropped and unwrap the `Shared<T>`
+    pub fn collect_into(self) -> CollectInto<T> {
+        CollectInto(Some(self))
+    }
+
     /// Obtain an owned copy of the lent resource
     pub fn to_owned(&self) -> T
     where
@@ -96,13 +99,6 @@ impl<T> Lender<T> {
     {
         self.as_ref().clone()
     }
-
-    // /// Wait for all outstanding borrows to be dropped and unwrap the `Shared<T>`
-    // pub fn collect_into(self) -> Result<T, LockError> {
-    //     unsafe { self.inner.to_ref() }.collect(None.into())?;
-    //     let inner = ManuallyDrop::new(self).inner;
-    //     Ok(unsafe { inner.into_box().into_inner() })
-    // }
 
     fn poll_collect(&mut self, waker: &Waker) -> Poll<()> {
         let result = if self.pending {
@@ -133,14 +129,14 @@ impl<T> Lender<T> {
 impl<T> AsRef<T> for Lender<T> {
     #[inline]
     fn as_ref(&self) -> &T {
-        &unsafe { self.inner.to_ref() }.value
+        unsafe { self.inner.to_ref() }.as_ref()
     }
 }
 
 impl<T> Borrow<T> for Lender<T> {
     #[inline]
     fn borrow(&self) -> &T {
-        &unsafe { self.inner.to_ref() }.value
+        unsafe { self.inner.to_ref() }.as_ref()
     }
 }
 
@@ -149,6 +145,12 @@ impl<T> Drop for Lender<T> {
         unsafe {
             SharedInner::drop_lender(self.inner, self.pending);
         }
+    }
+}
+
+impl<T> PartialEq for Lender<T> {
+    fn eq(&self, other: &Lender<T>) -> bool {
+        other.inner == self.inner
     }
 }
 
@@ -174,6 +176,7 @@ impl<T> SharedInner<T> {
         }
     }
 
+    #[inline]
     pub unsafe fn into_inner(self) -> T {
         self.value
     }
@@ -379,6 +382,20 @@ impl<T> SharedInner<T> {
     }
 }
 
+impl<T> AsRef<T> for SharedInner<T> {
+    #[inline]
+    fn as_ref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> AsMut<T> for SharedInner<T> {
+    #[inline]
+    fn as_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
+
 impl<T: Debug> Debug for SharedInner<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("SharedInner")
@@ -395,9 +412,22 @@ unsafe impl<T> Sync for SharedInner<T> {}
 pub struct Collect<'c, T>(Option<&'c mut Lender<T>>);
 
 impl<'c, T> Collect<'c, T> {
+    /// Resolve or abort the collection of the resource
+    pub fn resolve(self) -> Result<&'c mut T, &'c mut Lender<T>> {
+        let lender = ManuallyDrop::new(self)
+            .0
+            .take()
+            .expect("Cannot call Collect::resolve() after polling");
+        if lender.try_collect() {
+            return Ok(unsafe { lender.get_mut_unchecked() });
+        }
+        return Err(lender);
+    }
+
+    #[cfg(feature = "std")]
     /// Block the current thread on the collection of the shared resource
-    pub fn wait(mut self, timeout: impl Into<Expiry>) -> Result<&'c mut T, &'c mut Lender<T>> {
-        let lender = self
+    pub fn wait(self, timeout: impl Into<Expiry>) -> Result<&'c mut T, &'c mut Lender<T>> {
+        let lender = ManuallyDrop::new(self)
             .0
             .take()
             .expect("Cannot call Collect::wait() after polling");
@@ -445,6 +475,67 @@ impl<T> FusedFuture for Collect<'_, T> {
 
 impl<T> Unpin for Collect<'_, T> {}
 
+/// A `Future` which resolves when all outstanding borrows of the `Lender<T>`
+/// have been returned
+#[derive(Debug)]
+pub struct CollectInto<T>(Option<Lender<T>>);
+
+impl<T> CollectInto<T> {
+    /// Resolve or abort the collection of the resource
+    pub fn resolve(self) -> Result<T, Lender<T>> {
+        let mut lender = ManuallyDrop::new(self)
+            .0
+            .take()
+            .expect("Cannot call CollectInto::resolve() after polling");
+        if lender.try_collect() {
+            return Ok(unsafe { lender.into_inner() });
+        }
+        return Err(lender);
+    }
+
+    #[cfg(feature = "std")]
+    /// Block the current thread on the collection of the shared resource
+    pub fn wait(self, timeout: impl Into<Expiry>) -> Result<T, Lender<T>> {
+        let mut lender = ManuallyDrop::new(self)
+            .0
+            .take()
+            .expect("Cannot call CollectInto::wait() after polling");
+        if lender.try_collect() {
+            return Ok(unsafe { lender.into_inner() });
+        }
+        match block_on_poll(|cx| lender.poll_collect(cx.waker()), timeout) {
+            Poll::Ready(()) => Ok(unsafe { lender.into_inner() }),
+            Poll::Pending => Err(lender),
+        }
+    }
+}
+
+impl<T> Future for CollectInto<T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(mut lender) = self.0.take() {
+            match lender.poll_collect(cx.waker()) {
+                Poll::Ready(()) => Poll::Ready(unsafe { lender.into_inner() }),
+                Poll::Pending => {
+                    self.0.replace(lender);
+                    Poll::Pending
+                }
+            }
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl<T> FusedFuture for CollectInto<T> {
+    fn is_terminated(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl<T> Unpin for CollectInto<T> {}
+
 /// A tracking value which notifies its source when dropped
 #[derive(Debug)]
 pub struct Shared<T> {
@@ -472,6 +563,20 @@ impl<T> Shared<T> {
     }
 }
 
+impl<T> AsRef<T> for Shared<T> {
+    #[inline]
+    fn as_ref(&self) -> &T {
+        unsafe { self.inner.to_ref() }.as_ref()
+    }
+}
+
+impl<T> Borrow<T> for Shared<T> {
+    #[inline]
+    fn borrow(&self) -> &T {
+        unsafe { self.inner.to_ref() }.as_ref()
+    }
+}
+
 impl<T> Clone for Shared<T> {
     #[inline]
     fn clone(&self) -> Self {
@@ -484,7 +589,7 @@ impl<T> Deref for Shared<T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        &unsafe { self.inner.to_ref() }.value
+        unsafe { self.inner.to_ref() }.as_ref()
     }
 }
 
@@ -520,6 +625,20 @@ impl<T> SharedRef<'_, T> {
     }
 }
 
+impl<T> AsRef<T> for SharedRef<'_, T> {
+    #[inline]
+    fn as_ref(&self) -> &T {
+        unsafe { self.inner.to_ref() }.as_ref()
+    }
+}
+
+impl<T> Borrow<T> for SharedRef<'_, T> {
+    #[inline]
+    fn borrow(&self) -> &T {
+        unsafe { self.inner.to_ref() }.as_ref()
+    }
+}
+
 impl<T> Clone for SharedRef<'_, T> {
     fn clone(&self) -> Self {
         Self {
@@ -535,103 +654,6 @@ impl<T> Deref for SharedRef<'_, T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        &unsafe { self.inner.to_ref() }.value
-    }
-}
-
-/// Pin a value to the stack while it is being shared
-#[derive(Debug)]
-pub struct PinShared<T> {
-    inner: SharedInner<T>,
-}
-
-impl<T> PinShared<T> {
-    /// Construct a new `PinShared<T>`
-    pub fn new(data: T) -> Self {
-        Self {
-            inner: SharedInner::new(data),
-        }
-    }
-
-    /// Evaluate a function in the context of the shared value. This method will
-    /// block until all borrows of the value are dropped, allowing them to be safely
-    /// passed to other threads.
-    pub fn with<'s, R>(&'s mut self, f: impl FnOnce(ScopedRef<T>) -> R) -> R {
-        let _collect = CollectOnDrop(&self.inner);
-        f(ScopedRef::new(&self.inner))
-    }
-
-    /// Unwrap the contained value
-    #[inline]
-    pub fn into_inner(self) -> T {
-        unsafe { self.inner.into_inner() }
-    }
-}
-struct CollectOnDrop<'s, T>(&'s SharedInner<T>);
-
-impl<T> Drop for CollectOnDrop<'_, T> {
-    fn drop(&mut self) {
-        if !self.0.try_collect(false) {
-            let mut first = true;
-            let _ = block_on_poll(
-                |cx| {
-                    if first {
-                        first = false;
-                        self.0.start_poll(cx.waker())
-                    } else {
-                        self.0.resume_poll(cx.waker())
-                    }
-                },
-                None,
-            );
-        }
-    }
-}
-
-// unsafe impl<T: Send> Send for CollectOnDrop<'_, T> {}
-
-/// A tracking value which notifies its source when dropped
-#[derive(Debug)]
-pub struct ScopedRef<T> {
-    inner: *const SharedInner<T>,
-}
-
-unsafe impl<T: Send> Send for ScopedRef<T> {}
-unsafe impl<T: Sync> Sync for ScopedRef<T> {}
-
-impl<T> ScopedRef<T> {
-    #[inline]
-    pub(crate) fn new(inner: &SharedInner<T>) -> Self {
-        unsafe { SharedInner::inc_count_ref(inner) };
-        ScopedRef { inner }
-    }
-
-    /// Get the current number of borrows, including this one
-    #[inline]
-    pub fn borrow_count(&self) -> usize {
-        unsafe { &*self.inner }.borrow_count()
-    }
-}
-
-impl<T> Clone for ScopedRef<T> {
-    fn clone(&self) -> Self {
-        let inner = self.inner;
-        unsafe { SharedInner::inc_count_ref(inner) };
-        Self { inner }
-    }
-}
-
-impl<T> Deref for ScopedRef<T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &T {
-        &unsafe { &*self.inner }.value
-    }
-}
-
-impl<T> Drop for ScopedRef<T> {
-    fn drop(&mut self) {
-        unsafe { SharedInner::dec_count_ref(self.inner) };
+        unsafe { self.inner.to_ref() }.as_ref()
     }
 }

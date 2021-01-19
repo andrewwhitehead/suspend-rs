@@ -18,6 +18,9 @@ mod raw_park;
 
 pub mod listen;
 
+#[cfg(feature = "std")]
+pub mod scoped;
+
 pub mod shared;
 
 #[cfg(feature = "std")]

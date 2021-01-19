@@ -2,9 +2,9 @@ use core::time::Duration;
 use std::task::Poll;
 use std::thread;
 
-use suspend_core::shared::{with_scope, Lender, PinShared};
+use suspend_core::shared::Lender;
 
-use self::utils::{poll_once, Track};
+use self::utils::poll_once;
 
 mod utils;
 
@@ -22,6 +22,12 @@ fn lender_unshared_collect_poll() {
 }
 
 #[test]
+fn lender_unshared_collect_into_poll() {
+    let lender = Lender::new(true);
+    assert_eq!(poll_once(lender.collect_into()), Poll::Ready(true));
+}
+
+#[test]
 fn lender_unshared_collect_wait() {
     let mut lender = Lender::new(true);
     assert_eq!(
@@ -31,10 +37,53 @@ fn lender_unshared_collect_wait() {
 }
 
 #[test]
-fn lender_borrow_collect_pending() {
+fn lender_unshared_collect_into_wait() {
+    let lender = Lender::new(true);
+    assert_eq!(
+        lender.collect_into().wait(Duration::from_millis(100)),
+        Ok(true)
+    );
+}
+
+#[test]
+fn lender_borrow_collect_poll_retry() {
     let mut lender = Lender::new(true);
-    let _borrow = lender.borrow();
-    assert_eq!(poll_once(lender.collect()).is_pending(), true);
+    let borrow = lender.borrow();
+    let mut collect = lender.collect();
+    assert_eq!(poll_once(&mut collect).is_pending(), true);
+    drop(borrow);
+    assert_eq!(poll_once(&mut collect).is_ready(), true);
+}
+
+#[test]
+fn lender_borrow_collect_into_poll_retry() {
+    let lender = Lender::new(true);
+    let borrow = lender.borrow();
+    let mut collect = lender.collect_into();
+    assert_eq!(poll_once(&mut collect).is_pending(), true);
+    drop(borrow);
+    assert_eq!(poll_once(&mut collect), Poll::Ready(true));
+}
+
+#[test]
+fn lender_borrow_collect_resolve_retry() {
+    let mut lender = Lender::new(true);
+    let borrow = lender.borrow();
+    let lender = lender.collect().resolve().expect_err("Collect should fail");
+    drop(borrow);
+    assert_eq!(lender.collect().resolve().is_ok(), true);
+}
+
+#[test]
+fn lender_borrow_collect_into_resolve_retry() {
+    let lender = Lender::new(true);
+    let borrow = lender.borrow();
+    let lender = lender
+        .collect_into()
+        .resolve()
+        .expect_err("Collect should fail");
+    drop(borrow);
+    assert_eq!(lender.collect_into().resolve(), Ok(true));
 }
 
 #[test]
@@ -43,6 +92,16 @@ fn lender_borrow_collect_wait_timeout() {
     let _borrow = lender.borrow();
     lender
         .collect()
+        .wait(Duration::from_millis(100))
+        .expect_err("Should time out");
+}
+
+#[test]
+fn lender_borrow_collect_into_wait_timeout() {
+    let lender = Lender::new(true);
+    let _borrow = lender.borrow();
+    lender
+        .collect_into()
         .wait(Duration::from_millis(100))
         .expect_err("Should time out");
 }
@@ -102,86 +161,4 @@ fn lender_borrow_collect_threaded() {
     for th in threads {
         th.join().expect("Error joining thread");
     }
-}
-
-#[test]
-fn pin_shared_unused() {
-    let mut shared = PinShared::new(());
-    shared.with(|_| {});
-    assert_eq!(shared.into_inner(), ());
-}
-
-#[test]
-fn pin_shared_borrow() {
-    let mut shared = PinShared::new(());
-    shared.with(|scope| {
-        drop(scope.clone());
-    });
-    assert_eq!(shared.into_inner(), ());
-}
-
-#[cfg(feature = "std")]
-#[test]
-fn pin_shared_threaded() {
-    // test that dropping the future after the task is queued
-    // functions as expected
-    let (track, effect) = Track::new_pair();
-    let mut shared = PinShared::new(());
-    shared.with(|scope| {
-        track.call();
-        thread::spawn({
-            let scope = scope.clone();
-            let track = track.clone();
-            move || {
-                track.call();
-                drop(scope);
-            }
-        })
-        .join()
-        .unwrap();
-        track.call();
-    });
-    // the third call should not be executed because the future was dropped
-    assert_eq!(effect.call_count(), 3);
-    assert_eq!(effect.drop_count(), 1);
-    assert_eq!(shared.into_inner(), ());
-}
-
-#[test]
-fn with_scope_unused() {
-    assert_eq!(with_scope(|_scope| true), true);
-}
-
-#[test]
-fn with_scope_borrow() {
-    assert_eq!(
-        with_scope(|scope| {
-            for _ in 0..10 {
-                drop(scope.clone());
-            }
-            true
-        }),
-        true
-    );
-}
-
-#[cfg(feature = "std")]
-#[test]
-fn with_scope_borrow_threaded() {
-    assert_eq!(
-        with_scope(|scope| {
-            for _ in 0..10 {
-                thread::spawn({
-                    let scope = scope.clone();
-                    move || {
-                        drop(scope);
-                    }
-                })
-                .join()
-                .unwrap();
-            }
-            true
-        }),
-        true
-    );
 }
